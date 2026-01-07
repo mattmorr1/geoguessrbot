@@ -2,12 +2,17 @@
 __pycache__/
 *.py[codz]
 *$py.class
-
+etcd/
+wal/
+milvus/
+/config/
+pool.bin/
 # C extensions
+temp_processing/
 *.so
 .DS_Store
 /datasets/*
-/volumes/*
+volumes/
 # Distribution / packaging
 .Python
 build/
