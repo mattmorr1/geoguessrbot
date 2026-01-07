@@ -1,0 +1,4 @@
+- clean up
+- model
+- post processing
+- local model for interaction
