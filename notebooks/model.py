@@ -57,29 +57,28 @@ class GeoModel(nn.Module):
 
 
 # --- Training setup ---
-model = GeoModel().to(device)
-optimizer = torch.optim.AdamW(model.bridge.parameters(), lr=1e-4, weight_decay=1e-2)
+if __name__ == "__main__":
+    model = GeoModel().to(device)
+    optimizer = torch.optim.AdamW(model.bridge.parameters(), lr=1e-4, weight_decay=1e-2)
 
+    def contrastive_loss(pred_alpha, true_alpha, temperature=0.07):
+        logits = torch.matmul(pred_alpha, true_alpha.T) / temperature
+        labels = torch.arange(pred_alpha.size(0)).to(device)
+        return F.cross_entropy(logits, labels)
 
-def contrastive_loss(pred_alpha, true_alpha, temperature=0.07):
-    logits = torch.matmul(pred_alpha, true_alpha.T) / temperature
-    labels = torch.arange(pred_alpha.size(0)).to(device)
-    return F.cross_entropy(logits, labels)
+    def train_step(images, alpha_vecs):
+        """
+        Args:
+            images: list of PIL images
+            alpha_vecs: Tensor of shape (B, 64) — AlphaEarth target embeddings
+        """
+        model.train()
+        optimizer.zero_grad()
 
+        clip_vecs = model.encode_images(images)
+        pred_y = model(clip_vecs)
+        loss = contrastive_loss(pred_y, alpha_vecs)
 
-def train_step(images, alpha_vecs):
-    """
-    Args:
-        images: list of PIL images
-        alpha_vecs: Tensor of shape (B, 64) — AlphaEarth target embeddings
-    """
-    model.train()
-    optimizer.zero_grad()
-
-    clip_vecs = model.encode_images(images)
-    pred_y = model(clip_vecs)
-    loss = contrastive_loss(pred_y, alpha_vecs)
-
-    loss.backward()
-    optimizer.step()
-    return loss.item()
+        loss.backward()
+        optimizer.step()
+        return loss.item()
