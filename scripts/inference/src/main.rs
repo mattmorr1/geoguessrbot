@@ -8,6 +8,8 @@ const COLLECTION: &str = "world_locations";
 const TOP_K: usize = 10;
 const TOP_N: usize = 3;
 const EARTH_RADIUS_KM: f64 = 6371.0;
+const FALLBACK_THRESHOLD: f64 = 0.3; // if best hit similarity < this, retry unfiltered
+const CLUSTER_RADIUS_LIMIT: f64 = 500.0; // km -- if cluster > this, results are scattered
 
 // --- CLI ---
 
@@ -305,8 +307,9 @@ async fn main() {
         eprintln!("Constrained search: {f}");
     }
 
-    // primary: COSINE search on alphaearth_vec
-    let dna_hits = match search_milvus(dna_vec, "alphaearth_vec", filter.clone()).await {
+    // primary: COSINE search on alphaearth_vec (constrained by country if provided)
+    let dna_vec_clone = dna_vec.clone();
+    let mut dna_hits = match search_milvus(dna_vec, "alphaearth_vec", filter.clone()).await {
         Ok(h) => h,
         Err(e) => {
             eprintln!("Error in DNA search: {e}");
@@ -314,7 +317,28 @@ async fn main() {
         }
     };
 
-    // optional: L2 search on hyp_tangent_vec (Poincare proxy)
+    // confidence fallback: if constrained search quality is poor, retry unfiltered
+    if filter.is_some() {
+        let should_fallback = dna_hits.is_empty()
+            || dna_hits[0].distance < FALLBACK_THRESHOLD
+            || {
+                let r = refine(&dna_hits);
+                r.cluster_radius_km > CLUSTER_RADIUS_LIMIT
+            };
+
+        if should_fallback {
+            eprintln!("Constrained search quality low, retrying unfiltered...");
+            if let Ok(unfiltered) = search_milvus(dna_vec_clone, "alphaearth_vec", None).await {
+                if !unfiltered.is_empty()
+                    && (dna_hits.is_empty() || unfiltered[0].distance > dna_hits[0].distance)
+                {
+                    dna_hits = unfiltered;
+                }
+            }
+        }
+    }
+
+    // optional: L2 search on hyp_tangent_vec (Lorentz tangent proxy)
     let hits = if let Some(ref hyp_path) = cli.hyp_vector {
         let hyp_vec = match read_vector_file(hyp_path, 128) {
             Ok(v) => v,

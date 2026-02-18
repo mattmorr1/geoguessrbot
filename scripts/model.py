@@ -2,27 +2,19 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers import CLIPProcessor, CLIPModel
+import math
 
 device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
 
 # ============================================================
 # Lorentz Manifold Geometry
 # ============================================================
-# Switched from Poincare ball to Lorentz hyperboloid.
-# Poincare has gradient explosion near the boundary (norm->1).
-# Lorentz avoids this entirely -- gradients stay well-behaved
-# because the manifold is unbounded in ambient space.
 
 def lorentz_expmap0(v, eps=1e-10):
-    """Tangent space at origin -> Lorentz hyperboloid.
-    Input:  (B, d)   tangent vector
-    Output: (B, d+1) point on H^d, first dim is time component
-    """
     norm = v.norm(p=2, dim=-1, keepdim=True).clamp(min=eps)
     return torch.cat([torch.cosh(norm), torch.sinh(norm) * v / norm], dim=-1)
 
 def lorentz_logmap0(y, eps=1e-10):
-    """Lorentz hyperboloid -> tangent space at origin."""
     time = y[..., :1]
     space = y[..., 1:]
     norm_space = space.norm(p=2, dim=-1, keepdim=True).clamp(min=eps)
@@ -30,25 +22,75 @@ def lorentz_logmap0(y, eps=1e-10):
     return theta * space / norm_space
 
 def lorentz_dist(x, y, eps=1e-5):
-    """Geodesic distance on Lorentz hyperboloid.
-    d(x,y) = arccosh(-<x,y>_L)
-    """
     inner = -x[..., 0] * y[..., 0] + (x[..., 1:] * y[..., 1:]).sum(dim=-1)
     return torch.acosh((-inner).clamp(min=1 + eps))
 
 def lorentz_project(x, eps=1e-5):
-    """Re-project onto hyperboloid: fix x0 = sqrt(1 + ||x_space||^2)."""
     space = x[..., 1:]
     time = torch.sqrt(1 + space.pow(2).sum(dim=-1, keepdim=True) + eps)
     return torch.cat([time, space], dim=-1)
 
 
 # ============================================================
-# Multi-View Attention Pooling (PIGEON-style)
+# Embedding Augmentation
 # ============================================================
-# When 4 cardinal patches are available, aggregate via learned
-# attention. Falls through to identity for single-view input,
-# so the same model works with or without multi-view data.
+# Training on cached StreetCLIP vectors means no image-level augmentation.
+# This compensates: Gaussian noise simulates CLIP encoding variance,
+# feature dropout forces the bridge to not over-rely on any single
+# dimension of the 768d input.
+
+class EmbeddingAugmentor(nn.Module):
+    def __init__(self, noise_std=0.02, feat_drop=0.1):
+        super().__init__()
+        self.noise_std = noise_std
+        self.drop = nn.Dropout(feat_drop)
+
+    def forward(self, x):
+        if not self.training:
+            return x
+        x = self.drop(x)
+        return x + torch.randn_like(x) * self.noise_std
+
+
+# ============================================================
+# Contrastive Memory Queue (MoCo-style)
+# ============================================================
+# InfoNCE quality scales with number of negatives. With batch=32,
+# you only get 31 negatives per sample. This queue stores recent
+# AlphaEarth targets, giving thousands of additional negatives
+# without increasing batch size or VRAM.
+
+class ContrastiveQueue:
+    def __init__(self, dim=64, size=8192):
+        self.queue = torch.zeros(size, dim)
+        self.ptr = 0
+        self.full = False
+
+    @torch.no_grad()
+    def push(self, batch):
+        B = batch.size(0)
+        batch = batch.detach().cpu()
+        end = self.ptr + B
+        if end <= len(self.queue):
+            self.queue[self.ptr:end] = batch
+        else:
+            overflow = end - len(self.queue)
+            self.queue[self.ptr:] = batch[:B - overflow]
+            self.queue[:overflow] = batch[B - overflow:]
+            self.full = True
+        self.ptr = end % len(self.queue)
+
+    def get(self, dev):
+        if self.full:
+            return self.queue.to(dev)
+        if self.ptr == 0:
+            return None
+        return self.queue[:self.ptr].to(dev)
+
+
+# ============================================================
+# Multi-View Attention Pooling
+# ============================================================
 
 class MultiViewEncoder(nn.Module):
     def __init__(self, dim=768, num_heads=8):
@@ -82,9 +124,11 @@ class SharedEncoder(nn.Module):
             nn.LayerNorm(out_dim),
             nn.GELU(),
         )
+        # residual skip: preserves gradient flow through the deep path
+        self.skip = nn.Linear(in_dim, out_dim)
 
     def forward(self, x):
-        return self.net(x)
+        return self.net(x) + self.skip(x)
 
 
 class AdministrativeHead(nn.Module):
@@ -111,7 +155,6 @@ class PhysicalHead(nn.Module):
 
 
 class HierarchicalHead(nn.Module):
-    """Projects to 128D tangent space, then lifts to 129D Lorentz hyperboloid."""
     def __init__(self, in_dim=512, hyp_dim=128, num_continents=7, num_countries=250):
         super().__init__()
         self.hyp_dim = hyp_dim
@@ -135,12 +178,8 @@ class HierarchicalHead(nn.Module):
 
 
 class AuxiliaryDecoder(nn.Module):
-    """Decode climate zone and elevation from the predicted 64D DNA.
-    Forces the DNA vector to encode meaningful environmental semantics
-    instead of being an uninterpretable black box.
-    """
-    NUM_CLIMATE = 6   # tropical, arid, temperate, continental, polar, unknown
-    NUM_ELEV = 8      # <0m, 0-100, 100-500, 500-1k, 1k-2k, 2k-3k, 3k-5k, >5k
+    NUM_CLIMATE = 6
+    NUM_ELEV = 8
 
     def __init__(self, dna_dim=64):
         super().__init__()
@@ -161,6 +200,7 @@ class AuxiliaryDecoder(nn.Module):
 class AlphaBridge(nn.Module):
     def __init__(self, num_countries=250, num_continents=7, hyp_dim=128):
         super().__init__()
+        self.augment = EmbeddingAugmentor()
         self.views = MultiViewEncoder()
         self.encoder = SharedEncoder()
         self.admin = AdministrativeHead(num_classes=num_countries)
@@ -172,7 +212,16 @@ class AlphaBridge(nn.Module):
         )
         self.aux = AuxiliaryDecoder()
 
+        # learnable temperature for InfoNCE (CLIP-style)
+        # stored as log(1/t) so it stays positive and well-scaled
+        self.log_inv_temp = nn.Parameter(torch.tensor(math.log(1 / 0.07)))
+
+    @property
+    def temperature(self):
+        return (1 / self.log_inv_temp.exp()).clamp(min=0.005, max=1.0)
+
     def forward(self, x):
+        x = self.augment(x)
         x = self.views(x)
         z = self.encoder(x)
         tangent = self.hierarchical.tangent(z)
@@ -189,7 +238,7 @@ class AlphaBridge(nn.Module):
 
 
 # ============================================================
-# Full Model: Frozen StreetCLIP + Trainable Bridge
+# Full Model
 # ============================================================
 
 class AlphaEarthScout(nn.Module):
@@ -208,10 +257,6 @@ class AlphaEarthScout(nn.Module):
 
     @torch.no_grad()
     def encode_multi_view(self, image_groups):
-        """Encode N views per location.
-        image_groups: list of (list of PIL images), inner list = views of same place
-        Returns: (B, N, 768)
-        """
         all_vecs = []
         for views in image_groups:
             inputs = self.processor(images=views, return_tensors="pt", padding=True).to(device)
@@ -246,8 +291,12 @@ class AlphaEarthScout(nn.Module):
 # Loss Functions
 # ============================================================
 
-def info_nce_loss(pred, target, temperature=0.07):
-    logits = pred @ target.T / temperature
+def info_nce_loss(pred, target, temperature, queue_negs=None):
+    if queue_negs is not None:
+        all_targets = torch.cat([target, queue_negs], dim=0)
+    else:
+        all_targets = target
+    logits = pred @ all_targets.T / temperature
     labels = torch.arange(len(pred), device=pred.device)
     return F.cross_entropy(logits, labels)
 
@@ -271,9 +320,6 @@ def auxiliary_loss(outputs, targets):
 # ============================================================
 # Curriculum Scheduler
 # ============================================================
-# Country classification is the easiest signal -- high alpha early.
-# DNA contrastive alignment is harder -- ramp beta up over time.
-# Hierarchy and auxiliary are regularizers -- ramp gamma/aux slowly.
 
 class CurriculumScheduler:
     def __init__(self, total_epochs, warmup=2):
@@ -285,21 +331,28 @@ class CurriculumScheduler:
         if epoch < self.warmup:
             return {'alpha': 2.0, 'beta': 0.3, 'gamma': 0.1, 'aux': 0.1}
         return {
-            'alpha': 2.0 - 1.5 * t,  # 2.0 -> 0.5
-            'beta':  0.3 + 1.7 * t,  # 0.3 -> 2.0
-            'gamma': 0.1 + 0.9 * t,  # 0.1 -> 1.0
-            'aux':   0.1 + 0.4 * t,  # 0.1 -> 0.5
+            'alpha': 2.0 - 1.5 * t,
+            'beta':  0.3 + 1.7 * t,
+            'gamma': 0.1 + 0.9 * t,
+            'aux':   0.1 + 0.4 * t,
         }
 
 
-def scout_loss(outputs, targets, hier_head, weights=None):
+def scout_loss(outputs, targets, hier_head, temperature, weights=None,
+               queue_negs=None, label_smoothing=0.1):
     if weights is None:
         weights = {'alpha': 1.0, 'beta': 1.0, 'gamma': 0.5, 'aux': 0.3}
 
-    l_admin = F.cross_entropy(outputs['admin_logits'], targets['country_idx'])
-    l_dna = info_nce_loss(outputs['dna'], targets['alpha_vecs'])
+    # label smoothing on country CE -- reverse geocoding is noisy near borders
+    l_admin = F.cross_entropy(
+        outputs['admin_logits'], targets['country_idx'],
+        label_smoothing=label_smoothing,
+    )
+    l_dna = info_nce_loss(
+        outputs['dna'], targets['alpha_vecs'], temperature, queue_negs,
+    )
     l_hier = hierarchy_loss(
-        outputs['hyp'], targets['continent_idx'], targets['country_idx'], hier_head
+        outputs['hyp'], targets['continent_idx'], targets['country_idx'], hier_head,
     )
     l_aux = auxiliary_loss(outputs, targets)
 
@@ -314,4 +367,5 @@ def scout_loss(outputs, targets, hier_head, weights=None):
         'dna': l_dna.item(),
         'hier': l_hier.item(),
         'aux': l_aux.item(),
+        'temp': temperature.item() if hasattr(temperature, 'item') else temperature,
     }
