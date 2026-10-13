@@ -1,370 +1,333 @@
 use clap::Parser;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::io::Read;
 
-const MILVUS_URL: &str = "http://localhost:19530";
-const DB_NAME: &str = "geoguessr";
-const COLLECTION: &str = "world_locations";
-const TOP_K: usize = 10;
-const TOP_N: usize = 3;
-const EARTH_RADIUS_KM: f64 = 6371.0;
-const FALLBACK_THRESHOLD: f64 = 0.3; // if best hit similarity < this, retry unfiltered
-const CLUSTER_RADIUS_LIMIT: f64 = 500.0; // km -- if cluster > this, results are scattered
+const EARTH_RADIUS_KM: f64 = 6371.0088;
+const TOP_OUT: usize = 5;
 
 // --- CLI ---
 
 #[derive(Parser)]
-#[command(name = "inference", about = "AlphaEarth Scout inference engine")]
+#[command(name = "inference", about = "AlphaEarth Scout serving: leaf-filtered Milvus search + product-of-experts rescoring")]
 struct Cli {
-    /// Path to a JSON file containing a 64d vector array. Reads from stdin if omitted.
+    /// JSON-lines payload file from predict.py. Reads stdin if omitted.
     #[arg(short, long)]
-    vector: Option<String>,
+    payload: Option<String>,
 
-    /// Path to a JSON file containing a 32d hyperbolic tangent-space vector.
-    /// When provided, runs a secondary L2 search on hyp_tangent_vec and fuses results.
-    #[arg(long)]
-    hyp_vector: Option<String>,
+    #[arg(long, env = "MILVUS_URI", default_value = "http://localhost:19530")]
+    milvus_uri: String,
 
-    /// Country code filter (ISO alpha-2, e.g. "US"). Constrains search to this country.
-    #[arg(short, long)]
-    country: Option<String>,
+    #[arg(long, env = "MILVUS_TOKEN", default_value = "root:Milvus")]
+    milvus_token: String,
 
-    /// S2 cell token (level 10) for sub-country filtering.
-    #[arg(short, long)]
-    s2_token: Option<String>,
+    #[arg(long, env = "MILVUS_DB", default_value = "geoguessr")]
+    db: String,
+
+    #[arg(long, env = "MILVUS_COLLECTION", default_value = "world_locations_v2")]
+    collection: String,
 }
 
-// --- Output types ---
+// --- Payload / output ---
 
-#[derive(Debug, Serialize)]
-struct Prediction {
+/// One query from predict.py: prior = log p(leaf|img) - log n_leaf, score = prior + kappa * cos.
+#[derive(Debug, Deserialize)]
+struct Payload {
+    field: String,
+    vec: Vec<f32>,
+    cells: Vec<(i64, f64)>,
+    kappa: f64,
+    radius_km: f64,
+    limit: usize,
+    fallback: (f64, f64),
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct Scored {
     lat: f64,
     lon: f64,
-    confidence_pct: f64,
-    s2_token: String,
+    score: f64,
+    sim: f64,
+    leaf: i64,
     country_code: String,
-    distance_km: f64,
 }
 
 #[derive(Debug, Serialize)]
-struct InferenceResult {
-    predictions: Vec<Prediction>,
-    geodesic_lat: f64,
-    geodesic_lon: f64,
+struct Output {
+    lat: f64,
+    lon: f64,
+    cluster_size: usize,
     cluster_radius_km: f64,
+    fallback_used: bool,
+    top: Vec<Scored>,
 }
 
 // --- Milvus REST API types ---
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct SearchRequest {
-    db_name: String,
-    collection_name: String,
-    data: Vec<Vec<f32>>,
-    anns_field: String,
+struct SearchRequest<'a> {
+    db_name: &'a str,
+    collection_name: &'a str,
+    data: [&'a [f32]; 1],
+    anns_field: &'a str,
     limit: usize,
-    output_fields: Vec<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    filter: Option<String>,
+    output_fields: [&'static str; 4],
+    filter: String,
 }
 
 #[derive(Debug, Deserialize)]
 struct MilvusResponse {
     code: i32,
-    data: Option<Vec<MilvusHit>>,
+    data: Option<Vec<Hit>>,
     message: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
-struct MilvusHit {
+struct Hit {
     distance: f64,
-    gps: GpsField,
-    s2sphere_boundary: String,
-    #[serde(default)]
-    country_code: String,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct GpsField {
     lat: f64,
     lon: f64,
+    leaf: i64,
+    #[serde(default)]
+    country_code: String,
 }
 
 // --- Geodesic math ---
 
 fn haversine(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
-    let (dlat, dlon) = (
-        (lat2 - lat1).to_radians(),
-        (lon2 - lon1).to_radians(),
-    );
+    let (dlat, dlon) = ((lat2 - lat1).to_radians(), (lon2 - lon1).to_radians());
     let a = (dlat / 2.0).sin().powi(2)
         + lat1.to_radians().cos() * lat2.to_radians().cos() * (dlon / 2.0).sin().powi(2);
     EARTH_RADIUS_KM * 2.0 * a.sqrt().atan2((1.0 - a).sqrt())
 }
 
-fn geodesic_center(hits: &[MilvusHit], weights: &[f64]) -> (f64, f64) {
-    let total: f64 = weights.iter().sum();
-    if total == 0.0 {
-        return (hits[0].gps.lat, hits[0].gps.lon);
+/// Weighted mean of unit vectors, projected back to the sphere.
+fn geodesic_center(points: &[(f64, f64)], weights: &[f64]) -> (f64, f64) {
+    let (x, y, z) = points.iter().zip(weights).fold((0.0, 0.0, 0.0), |(x, y, z), (&(lat, lon), &w)| {
+        let (la, lo) = (lat.to_radians(), lon.to_radians());
+        (x + w * la.cos() * lo.cos(), y + w * la.cos() * lo.sin(), z + w * la.sin())
+    });
+    if x == 0.0 && y == 0.0 && z == 0.0 {
+        return points[0];
     }
+    (z.atan2((x * x + y * y).sqrt()).to_degrees(), y.atan2(x).to_degrees())
+}
 
-    // weighted average in cartesian, then back to lat/lon
-    let (mut x, mut y, mut z) = (0.0, 0.0, 0.0);
-    for (hit, &w) in hits.iter().zip(weights.iter()) {
-        let lat_r = hit.gps.lat.to_radians();
-        let lon_r = hit.gps.lon.to_radians();
-        x += w * lat_r.cos() * lon_r.cos();
-        y += w * lat_r.cos() * lon_r.sin();
-        z += w * lat_r.sin();
+// --- Scoring (mirrors eval.py serve mode) ---
+
+fn build_filter(cells: &[(i64, f64)]) -> Option<String> {
+    if cells.is_empty() {
+        return None;
     }
-    x /= total;
-    y /= total;
-    z /= total;
+    let ids: Vec<String> = cells.iter().map(|(l, _)| l.to_string()).collect();
+    Some(format!("leaf in [{}]", ids.join(",")))
+}
 
-    let lat = z.atan2((x * x + y * y).sqrt()).to_degrees();
-    let lon = y.atan2(x).to_degrees();
-    (lat, lon)
+fn rescore(hits: Vec<Hit>, cells: &[(i64, f64)], kappa: f64) -> Vec<Scored> {
+    let prior: HashMap<i64, f64> = cells.iter().copied().collect();
+    let mut scored: Vec<Scored> = hits
+        .into_iter()
+        .filter_map(|h| {
+            prior.get(&h.leaf).map(|p| Scored {
+                lat: h.lat,
+                lon: h.lon,
+                score: p + kappa * h.distance,
+                sim: h.distance,
+                leaf: h.leaf,
+                country_code: h.country_code,
+            })
+        })
+        .collect();
+    scored.sort_by(|a, b| b.score.total_cmp(&a.score));
+    scored
+}
+
+/// Score-weighted center of hits within radius_km of the best hit; None when there are no hits.
+fn refine(scored: &[Scored], radius_km: f64) -> Option<(f64, f64, usize, f64)> {
+    let best = scored.first()?;
+    let cluster: Vec<&Scored> = scored
+        .iter()
+        .filter(|s| haversine(best.lat, best.lon, s.lat, s.lon) <= radius_km)
+        .collect();
+    let points: Vec<(f64, f64)> = cluster.iter().map(|s| (s.lat, s.lon)).collect();
+    let weights: Vec<f64> = cluster.iter().map(|s| (s.score - best.score).exp()).collect();
+    let (lat, lon) = geodesic_center(&points, &weights);
+    let radius = points.iter().map(|&(a, b)| haversine(lat, lon, a, b)).fold(0.0_f64, f64::max);
+    Some((lat, lon, cluster.len(), radius))
+}
+
+fn resolve(hits: Vec<Hit>, p: &Payload) -> Output {
+    let scored = rescore(hits, &p.cells, p.kappa);
+    match refine(&scored, p.radius_km) {
+        Some((lat, lon, n, r)) => Output {
+            lat,
+            lon,
+            cluster_size: n,
+            cluster_radius_km: r,
+            fallback_used: false,
+            top: scored.into_iter().take(TOP_OUT).collect(),
+        },
+        None => Output {
+            lat: p.fallback.0,
+            lon: p.fallback.1,
+            cluster_size: 0,
+            cluster_radius_km: 0.0,
+            fallback_used: true,
+            top: Vec::new(),
+        },
+    }
 }
 
 // --- Milvus search ---
 
-fn build_filter(country: &Option<String>, s2_token: &Option<String>) -> Option<String> {
-    let mut parts = Vec::new();
-    if let Some(cc) = country {
-        parts.push(format!("country_code == '{}'", cc));
-    }
-    if let Some(s2) = s2_token {
-        parts.push(format!("s2_token_l10 == '{}'", s2));
-    }
-    if parts.is_empty() {
-        None
-    } else {
-        Some(parts.join(" AND "))
-    }
-}
-
-async fn search_milvus(
-    query_vec: Vec<f32>,
-    anns_field: &str,
-    filter: Option<String>,
-) -> Result<Vec<MilvusHit>, Box<dyn std::error::Error>> {
-    let client = reqwest::Client::new();
-
+async fn search(client: &reqwest::Client, cli: &Cli, p: &Payload) -> Result<Vec<Hit>, Box<dyn std::error::Error>> {
+    let Some(filter) = build_filter(&p.cells) else {
+        return Ok(Vec::new());
+    };
     let body = SearchRequest {
-        db_name: DB_NAME.to_string(),
-        collection_name: COLLECTION.to_string(),
-        data: vec![query_vec],
-        anns_field: anns_field.to_string(),
-        limit: TOP_K,
-        output_fields: vec![
-            "gps".to_string(),
-            "s2sphere_boundary".to_string(),
-            "country_code".to_string(),
-        ],
+        db_name: &cli.db,
+        collection_name: &cli.collection,
+        data: [&p.vec],
+        anns_field: &p.field,
+        limit: p.limit,
+        output_fields: ["lat", "lon", "leaf", "country_code"],
         filter,
     };
-
-    let resp = client
-        .post(format!("{}/v2/vectordb/entities/search", MILVUS_URL))
-        .header("Authorization", "Bearer root:Milvus")
-        .header("Content-Type", "application/json")
+    let resp: MilvusResponse = client
+        .post(format!("{}/v2/vectordb/entities/search", cli.milvus_uri))
+        .bearer_auth(&cli.milvus_token)
         .json(&body)
         .send()
+        .await?
+        .json()
         .await?;
-
-    let milvus_resp: MilvusResponse = resp.json().await?;
-
-    if milvus_resp.code != 0 {
-        return Err(format!(
-            "Milvus error (code {}): {}",
-            milvus_resp.code,
-            milvus_resp.message.unwrap_or_default()
-        )
-        .into());
+    if resp.code != 0 {
+        return Err(format!("Milvus error (code {}): {}", resp.code, resp.message.unwrap_or_default()).into());
     }
-
-    milvus_resp
-        .data
-        .ok_or_else(|| "Milvus returned no data".into())
-}
-
-// --- Refinement ---
-
-fn refine(hits: &[MilvusHit]) -> InferenceResult {
-    let weights: Vec<f64> = hits.iter().map(|h| h.distance.max(0.0)).collect();
-    let total_weight: f64 = weights.iter().sum();
-
-    let (geo_lat, geo_lon) = geodesic_center(hits, &weights);
-
-    // cluster radius: max haversine distance from center to any hit
-    let cluster_radius = hits
-        .iter()
-        .map(|h| haversine(geo_lat, geo_lon, h.gps.lat, h.gps.lon))
-        .fold(0.0_f64, f64::max);
-
-    let top_n = &hits[..TOP_N.min(hits.len())];
-    let top_weights: Vec<f64> = top_n.iter().map(|h| h.distance.max(0.0)).collect();
-    let top_sum: f64 = top_weights.iter().sum();
-
-    let predictions: Vec<Prediction> = top_n
-        .iter()
-        .zip(top_weights.iter())
-        .map(|(hit, &w)| {
-            let dist = haversine(geo_lat, geo_lon, hit.gps.lat, hit.gps.lon);
-            Prediction {
-                lat: hit.gps.lat,
-                lon: hit.gps.lon,
-                confidence_pct: if top_sum > 0.0 {
-                    (w / top_sum) * 100.0
-                } else {
-                    100.0 / TOP_N as f64
-                },
-                s2_token: hit.s2sphere_boundary.clone(),
-                country_code: hit.country_code.clone(),
-                distance_km: dist,
-            }
-        })
-        .collect();
-
-    InferenceResult {
-        predictions,
-        geodesic_lat: geo_lat,
-        geodesic_lon: geo_lon,
-        cluster_radius_km: cluster_radius,
-    }
-}
-
-fn read_vector_file(path: &str, expected_dim: usize) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
-    let json_str = std::fs::read_to_string(path)?;
-    let vec: Vec<f32> = serde_json::from_str(json_str.trim())?;
-    if vec.len() != expected_dim {
-        return Err(format!("Expected {}d vector, got {}d", expected_dim, vec.len()).into());
-    }
-    Ok(vec)
-}
-
-fn read_vector_stdin(expected_dim: usize) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
-    let mut buf = String::new();
-    std::io::stdin().read_to_string(&mut buf)?;
-    let vec: Vec<f32> = serde_json::from_str(buf.trim())?;
-    if vec.len() != expected_dim {
-        return Err(format!("Expected {}d vector, got {}d", expected_dim, vec.len()).into());
-    }
-    Ok(vec)
-}
-
-/// Fuse two hit lists by GPS proximity. If a DNA hit and a hyperbolic hit
-/// are within `radius_km`, boost the DNA hit's weight. Otherwise keep both.
-fn fuse_hits(dna_hits: Vec<MilvusHit>, hyp_hits: Vec<MilvusHit>, radius_km: f64) -> Vec<MilvusHit> {
-    let mut fused = dna_hits;
-    for hh in &hyp_hits {
-        let already_close = fused.iter().any(|dh| {
-            haversine(dh.gps.lat, dh.gps.lon, hh.gps.lat, hh.gps.lon) < radius_km
-        });
-        if already_close {
-            // boost existing nearby hit
-            for dh in fused.iter_mut() {
-                if haversine(dh.gps.lat, dh.gps.lon, hh.gps.lat, hh.gps.lon) < radius_km {
-                    dh.distance = (dh.distance + hh.distance) / 2.0;
-                    break;
-                }
-            }
-        } else {
-            // novel location from hyperbolic search, add it
-            fused.push(MilvusHit {
-                distance: hh.distance * 0.5, // lower confidence for hyp-only hits
-                gps: GpsField { lat: hh.gps.lat, lon: hh.gps.lon },
-                s2sphere_boundary: hh.s2sphere_boundary.clone(),
-                country_code: hh.country_code.clone(),
-            });
-        }
-    }
-    // re-sort by distance descending (higher = more similar for COSINE)
-    fused.sort_by(|a, b| b.distance.partial_cmp(&a.distance).unwrap_or(std::cmp::Ordering::Equal));
-    fused.truncate(TOP_K);
-    fused
+    Ok(resp.data.unwrap_or_default())
 }
 
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
-
-    let dna_vec = match &cli.vector {
-        Some(path) => read_vector_file(path, 64),
-        None => read_vector_stdin(64),
-    };
-    let dna_vec = match dna_vec {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("Error reading DNA vector: {e}");
-            std::process::exit(1);
+    let input = match &cli.payload {
+        Some(path) => std::fs::read_to_string(path),
+        None => {
+            let mut buf = String::new();
+            std::io::stdin().read_to_string(&mut buf).map(|_| buf)
         }
     };
-
-    let filter = build_filter(&cli.country, &cli.s2_token);
-    if let Some(ref f) = filter {
-        eprintln!("Constrained search: {f}");
-    }
-
-    // primary: COSINE search on alphaearth_vec (constrained by country if provided)
-    let dna_vec_clone = dna_vec.clone();
-    let mut dna_hits = match search_milvus(dna_vec, "alphaearth_vec", filter.clone()).await {
-        Ok(h) => h,
-        Err(e) => {
-            eprintln!("Error in DNA search: {e}");
-            std::process::exit(1);
-        }
-    };
-
-    // confidence fallback: if constrained search quality is poor, retry unfiltered
-    if filter.is_some() {
-        let should_fallback = dna_hits.is_empty()
-            || dna_hits[0].distance < FALLBACK_THRESHOLD
-            || {
-                let r = refine(&dna_hits);
-                r.cluster_radius_km > CLUSTER_RADIUS_LIMIT
-            };
-
-        if should_fallback {
-            eprintln!("Constrained search quality low, retrying unfiltered...");
-            if let Ok(unfiltered) = search_milvus(dna_vec_clone, "alphaearth_vec", None).await {
-                if !unfiltered.is_empty()
-                    && (dna_hits.is_empty() || unfiltered[0].distance > dna_hits[0].distance)
-                {
-                    dna_hits = unfiltered;
-                }
-            }
-        }
-    }
-
-    // optional: L2 search on hyp_tangent_vec (Lorentz tangent proxy)
-    let hits = if let Some(ref hyp_path) = cli.hyp_vector {
-        let hyp_vec = match read_vector_file(hyp_path, 128) {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!("Error reading hyperbolic vector: {e}");
-                std::process::exit(1);
-            }
-        };
-        eprintln!("Running dual search: DNA (COSINE) + Hyperbolic (L2)");
-        let hyp_hits = match search_milvus(hyp_vec, "hyp_tangent_vec", filter).await {
-            Ok(h) => h,
-            Err(e) => {
-                eprintln!("Hyperbolic search failed, falling back to DNA only: {e}");
-                dna_hits.clone()
-            }
-        };
-        fuse_hits(dna_hits, hyp_hits, 50.0)
-    } else {
-        dna_hits
-    };
-
-    if hits.is_empty() {
-        eprintln!("No results found");
+    let input = input.unwrap_or_else(|e| {
+        eprintln!("Error reading payload: {e}");
         std::process::exit(1);
+    });
+
+    let client = reqwest::Client::new();
+    for line in input.lines().filter(|l| !l.trim().is_empty()) {
+        let payload: Payload = serde_json::from_str(line).unwrap_or_else(|e| {
+            eprintln!("Invalid payload: {e}");
+            std::process::exit(1);
+        });
+        let hits = search(&client, &cli, &payload).await.unwrap_or_else(|e| {
+            eprintln!("Search failed: {e}");
+            std::process::exit(1);
+        });
+        println!("{}", serde_json::to_string(&resolve(hits, &payload)).unwrap());
+    }
+}
+
+// ── Unit tests ────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hit(lat: f64, lon: f64, sim: f64, leaf: i64) -> Hit {
+        Hit { distance: sim, lat, lon, leaf, country_code: String::new() }
     }
 
-    let result = refine(&hits);
-    println!("{}", serde_json::to_string_pretty(&result).unwrap());
+    fn payload(cells: Vec<(i64, f64)>, radius_km: f64) -> Payload {
+        Payload { field: "ae_vec".into(), vec: vec![0.0; 64], cells, kappa: 10.0, radius_km, limit: 64, fallback: (1.0, 2.0) }
+    }
+
+    #[test]
+    fn test_haversine_paris_london() {
+        // Paris (48.8566, 2.3522) → London (51.5074, -0.1278) ≈ 341 km
+        let d = haversine(48.8566, 2.3522, 51.5074, -0.1278);
+        assert!((d - 341.0).abs() < 5.0, "expected ~341 km, got {d:.1}");
+    }
+
+    #[test]
+    fn test_haversine_same_point() {
+        let d = haversine(48.8566, 2.3522, 48.8566, 2.3522);
+        assert!(d < 1e-6, "same-point distance should be ~0, got {d}");
+    }
+
+    #[test]
+    fn test_haversine_antipodal() {
+        // Antipodal points should be ~π * R ≈ 20015 km
+        let d = haversine(0.0, 0.0, 0.0, 180.0);
+        assert!((d - 20015.0).abs() < 10.0, "antipodal distance: {d:.1}");
+    }
+
+    #[test]
+    fn test_geodesic_center_symmetric() {
+        let (lat, lon) = geodesic_center(&[(10.0, 0.0), (-10.0, 0.0)], &[1.0, 1.0]);
+        assert!(lat.abs() < 1e-6 && lon.abs() < 1e-6, "centre should be (0,0), got ({lat},{lon})");
+    }
+
+    #[test]
+    fn test_geodesic_center_single_point() {
+        let (lat, lon) = geodesic_center(&[(48.8566, 2.3522)], &[0.9]);
+        assert!((lat - 48.8566).abs() < 1e-4 && (lon - 2.3522).abs() < 1e-4);
+    }
+
+    #[test]
+    fn test_build_filter() {
+        assert_eq!(build_filter(&[]), None);
+        assert_eq!(build_filter(&[(3, -1.0), (17, -2.0)]).unwrap(), "leaf in [3,17]");
+    }
+
+    #[test]
+    fn test_rescore_prior_outweighs_small_similarity_gap() {
+        // leaf 1 has a much stronger cell prior; a slightly higher cosine in leaf 2 must not win
+        let hits = vec![hit(0.0, 0.0, 0.80, 2), hit(10.0, 10.0, 0.78, 1)];
+        let s = rescore(hits, &[(1, -0.5), (2, -5.0)], 10.0);
+        assert_eq!(s[0].leaf, 1);
+        assert!((s[0].score - (-0.5 + 7.8)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_rescore_drops_hits_outside_payload_cells() {
+        let s = rescore(vec![hit(0.0, 0.0, 0.9, 99)], &[(1, 0.0)], 10.0);
+        assert!(s.is_empty());
+    }
+
+    #[test]
+    fn test_refine_excludes_far_outlier() {
+        // two Paris hits and one NYC hit: a 25 km cluster must stay in Paris, not drift into the Atlantic
+        let hits = vec![hit(48.8566, 2.3522, 0.9, 1), hit(48.86, 2.36, 0.88, 1), hit(40.7128, -74.006, 0.89, 1)];
+        let out = resolve(hits, &payload(vec![(1, 0.0)], 25.0));
+        assert_eq!(out.cluster_size, 2);
+        assert!(haversine(out.lat, out.lon, 48.8566, 2.3522) < 2.0);
+        assert!(!out.fallback_used);
+    }
+
+    #[test]
+    fn test_resolve_falls_back_without_hits() {
+        let out = resolve(Vec::new(), &payload(vec![(1, 0.0)], 25.0));
+        assert!(out.fallback_used);
+        assert_eq!((out.lat, out.lon), (1.0, 2.0));
+    }
+
+    #[test]
+    fn test_payload_parses_predict_py_shape() {
+        let p: Payload = serde_json::from_str(
+            r#"{"field":"ae_vec","vec":[0.1,0.2],"cells":[[5,-1.25]],"kappa":20,"radius_km":25,"limit":64,"fallback":[48.8,2.3]}"#,
+        )
+        .unwrap();
+        assert_eq!(p.cells, vec![(5, -1.25)]);
+        assert_eq!(p.fallback, (48.8, 2.3));
+    }
 }
