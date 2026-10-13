@@ -1,0 +1,3 @@
+slop-stamp 2
+error rust-analyzer scip exited with exit status: 1
+0090fedd65e031382e25067fe59027542fd89674155e4baf523c8788383f76c5 scripts/inference/src/main.rs
