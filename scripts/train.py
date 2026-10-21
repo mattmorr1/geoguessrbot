@@ -53,9 +53,9 @@ class EMA:
 
 # ── Data ──────────────────────────────────────────────────────────────────────
 
-def load_data(subset, ae_radius, need_ctx=False, feats="streetclip", rows="all", pyr=None, loc_level=None):
+def load_data(subset, ae_radius, need_ctx=False, feats="streetclip", rows="all", pyr=None, loc_level=None, holdout=None):
     """Train dict over encoded train rows; val = tune slice of the test split (eval.Env). ctx stays on the host."""
-    env = Env(ae_radius, feats, rows)
+    env = Env(ae_radius, feats, rows, holdout)
     meta, rows = env.train, env.rows
     pos = np.arange(len(rows)) if subset == "full" else np.flatnonzero(bins.zip_of("train")[rows] < 4)
     if "holdout" in meta:
@@ -77,8 +77,9 @@ def load_data(subset, ae_radius, need_ctx=False, feats="streetclip", rows="all",
 
 
 def to_gpu(d):
-    t = {k: torch.as_tensor(d[k]).to(device) for k in (*BATCH_KEYS, "leaf", "group")}
-    t["ae_ok"] = t["ae_ok"].float()
+    """Everything on the GPU except image features, which stay in host RAM (4.9M x 768 fp16 exceeds 8 GB)."""
+    t = {k: torch.as_tensor(d[k]).to(device) for k in (*BATCH_KEYS, "leaf", "group") if k != "x"}
+    t["x"], t["ae_ok"] = torch.as_tensor(np.asarray(d["x"])), t["ae_ok"].float()
     return t
 
 
@@ -103,7 +104,8 @@ def train(a) -> None:
     os.makedirs(run_dir, exist_ok=True)
 
     pyr = bins.Pyramid() if "pyr" in a.loc else None
-    cells, tr, va = load_data(a.subset, a.ae_radius, "ae" in a.loc.split("+"), a.feats, a.rows, pyr, a.loc_level)
+    cells, tr, va = load_data(a.subset, a.ae_radius, "ae" in a.loc.split("+"), a.feats, a.rows, pyr, a.loc_level,
+                              a.holdout)
     if a.w_ae > 0 and not tr["ae_ok"].any():
         raise SystemExit(f"--w-ae {a.w_ae} but no train AlphaEarth targets at r={a.ae_radius}")
     logger.info("train %d | val %d | AE valid %.1f%% | leaves %d",
@@ -147,9 +149,10 @@ def train(a) -> None:
             batches = cell_batches(T["leaf"], a.batch_size, steps) if a.batch == "cell" else iid_batches(n, a.batch_size, steps)
             # tower batches are cell-structured at --loc-level: negatives share the cell the prior hands the tower
             loc_b = cell_batches(T["group"], a.batch_size, steps) if a.loc != "none" else None
-            loc_c = loc_b.cpu() if H is not None else None
+            loc_c = loc_b.cpu() if loc_b is not None else None
+            batches_c = batches.cpu()
             for s, idx in enumerate(batches):
-                b = {k: T[k][idx] for k in BATCH_KEYS}
+                b = {k: T[k][batches_c[s]].to(device) if k == "x" else T[k][idx] for k in BATCH_KEYS}
                 ctx["queue"], ctx["temperature"] = queue.get(device), model.temperature
                 with torch.autocast("cuda", dtype=torch.float16, enabled=USE_AMP):
                     out = model(b["x"])
@@ -158,7 +161,7 @@ def train(a) -> None:
                         j = loc_b[s]
                         v = model.tower(None if H is None else H[loc_c[s]].to(device, non_blocking=True), T["xyz"][j],
                                         None if PT is None else pyramid_feats(PT[0], PT[1], PT[2][j]))
-                        l_loc = cross_view_loss(model.loc_head(model.trunk(T["x"][j])), v, T["xyz"][j],
+                        l_loc = cross_view_loss(model.loc_head(model.trunk(T["x"][loc_c[s]].to(device))), v, T["xyz"][j],
                                                 model.loc_temperature, a.loc_tau_km)
                         loss, parts["loc"] = loss + a.w_loc * l_loc, l_loc.detach()
                 opt.zero_grad(set_to_none=True)
@@ -219,6 +222,7 @@ def main() -> None:
     ap.add_argument("--batch-size", type=int, default=config.TRAIN_BATCH_SIZE)
     ap.add_argument("--lr", type=float, default=config.LR)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--holdout", choices=["seq"], help="withhold bins.seq_holdout train rows (reranker training queries)")
     a = ap.parse_args()
     os.makedirs(os.path.join(config.RUNS_DIR, a.name), exist_ok=True)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s",

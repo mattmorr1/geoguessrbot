@@ -18,8 +18,25 @@ from PIL import Image
 
 import bins
 import config
-from eval import Decoupled, encode_queries
-from model import encode_pixels, load_bridge, load_streetclip
+from eval import FEATS, Decoupled, encode_queries
+from model import encode_pixels, load_backbone, load_bridge
+
+
+def load_encoders(feats):
+    """Frozen backbones for a checkpoint's feature set; fusion768 also loads the train-fit PCA."""
+    pca = np.load(os.path.join(config.FEAT_DIR, f"{feats}_pca.npz")) if feats == "fusion768" else None
+    return [load_backbone(b) for b in (FEATS["fusion"] if pca is not None else FEATS[feats])], pca
+
+
+@torch.no_grad()
+def encode_images(encoders, images):
+    """PIL images -> [N, dim] fp16 features, matching bins.load_feats / bins.fuse on stored shards."""
+    backbones, pca = encoders
+    parts = [encode_pixels(v, p(images=images, return_tensors="pt")["pixel_values"]).float().cpu().numpy() for p, v in backbones]
+    if len(parts) == 1:
+        return parts[0].astype(np.float16)
+    x = np.concatenate([f / np.linalg.norm(f, axis=1, keepdims=True) for f in parts], 1)
+    return (((x.astype(np.float16).astype(np.float32) - pca["mean"]) @ pca["W"]) if pca is not None else x).astype(np.float16)
 
 
 def make_payloads(model, clip_feats, cfg):
@@ -42,14 +59,9 @@ def main() -> None:
     a = ap.parse_args()
     cfg = json.load(open(os.path.join(config.RESULTS_DIR, "best_config.json")))
     model, ck = load_bridge(cfg["ckpt"])
-    if ck["args"].get("feats", "streetclip") != "streetclip":
-        raise SystemExit(f"serving encodes with StreetCLIP; {cfg['ckpt']} was trained on {ck['args']['feats']} features")
     if cfg["prior_ckpt"]:
         model = Decoupled(load_bridge(cfg["prior_ckpt"])[0], model)
-    processor, vision = load_streetclip()
-    px = processor(images=[Image.open(p).convert("RGB") for p in a.images], return_tensors="pt")["pixel_values"]
-    with torch.no_grad():
-        feats = encode_pixels(vision, px).float().cpu()
+    feats = encode_images(load_encoders(ck["args"].get("feats", "streetclip")), [Image.open(p).convert("RGB") for p in a.images])
     for pl in make_payloads(model, feats, cfg):
         print(json.dumps(pl))
 

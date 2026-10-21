@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Geolocate Demo</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+<style>
+  :root { --bg: #f6f6f4; --fg: #1d1d1b; --muted: #6b6b66; --line: #d9d9d4; --panel: #fff; }
+  @media (prefers-color-scheme: dark) { :root { --bg: #161615; --fg: #ececea; --muted: #9a9a94; --line: #33332f; --panel: #1f1f1d; } }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 14px/1.4 system-ui, sans-serif; background: var(--bg); color: var(--fg); display: grid;
+         grid-template-columns: 320px 1fr; height: 100vh; }
+  aside { padding: 16px; border-right: 1px solid var(--line); background: var(--panel); overflow-y: auto; }
+  #drop { border: 2px dashed var(--line); border-radius: 8px; padding: 20px; text-align: center; color: var(--muted); cursor: pointer; }
+  #drop.over { border-color: var(--fg); }
+  #preview { width: 100%; margin-top: 12px; border-radius: 6px; display: none; }
+  table { width: 100%; border-collapse: collapse; margin-top: 12px; }
+  td { padding: 4px 0; border-bottom: 1px solid var(--line); }
+  td:last-child { text-align: right; font-variant-numeric: tabular-nums; }
+  .dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 6px; }
+  #status, .note { color: var(--muted); margin-top: 10px; }
+  #map { height: 100vh; }
+  @media (max-width: 700px) { body { grid-template-columns: 1fr; grid-template-rows: auto 60vh; height: auto; }
+                              #map { height: 60vh; } aside { border-right: 0; } }
+</style>
+</head>
+<body>
+<aside>
+  <div id="drop">Drop, paste or click to choose a photo<input id="file" type="file" accept="image/*" hidden></div>
+  <img id="preview" alt="uploaded photo">
+  <div id="status"></div>
+  <table id="out"></table>
+  <p class="note">Circles: top cells of the classifier prior (area ~ probability). Photos with EXIF GPS show the truth in black.</p>
+</aside>
+<div id="map"></div>
+<script>
+const COLORS = { FINAL: "#1a9e5c", B0: "#8a8a84", B2: "#2f6fdf", T2: "#d9534f" };
+const NAMES = { FINAL: "Final (gated)", B0: "B0 cell prior", B2: "B2 photo kNN", T2: "T2 AlphaEarth map" };
+const map = L.map("map", { worldCopyJump: true }).setView([20, 0], 2);
+L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", { maxZoom: 18, attribution: "&copy; OpenStreetMap" }).addTo(map);
+let layer = L.layerGroup().addTo(map);
+const $ = id => document.getElementById(id);
+
+async function run(file) {
+  $("preview").src = URL.createObjectURL(file); $("preview").style.display = "block";
+  $("status").textContent = "Locating..."; $("out").innerHTML = ""; layer.clearLayers();
+  const r = await fetch("/predict", { method: "POST", body: file });
+  const res = await r.json();
+  if (!r.ok) { $("status").textContent = res.error; return; }
+  $("status").textContent = res.truth ? `Truth from EXIF; nearest training row ${res.nn_train_km.toFixed(1)} km away` : "No EXIF GPS: no ground truth";
+  const pts = [];
+  for (const [lat, lon, p] of res.cells)
+    L.circleMarker([lat, lon], { radius: 3 + 30 * Math.sqrt(p), color: "#e0a030", weight: 1, fillOpacity: 0.25 })
+      .bindTooltip(`${(100 * p).toFixed(1)}%`).addTo(layer);
+  for (const m of ["FINAL", "B0", "B2", "T2"]) {
+    const ll = res.preds[m];
+    L.circleMarker(ll, { radius: m === "FINAL" ? 12 : 8, color: "#000", weight: 1, fillColor: COLORS[m], fillOpacity: 1 }).bindTooltip(NAMES[m]).addTo(layer);
+    if (res.truth) L.polyline([res.truth, ll], { color: COLORS[m], weight: 2, dashArray: "4 4" }).addTo(layer);
+    pts.push(ll);
+    const err = res.err_km ? `${res.err_km[m].toFixed(1)} km` : `${ll[0].toFixed(3)}, ${ll[1].toFixed(3)}`;
+    $("out").insertAdjacentHTML("beforeend", `<tr><td><span class="dot" style="background:${COLORS[m]}"></span>${NAMES[m]}</td><td>${err}</td></tr>`);
+  }
+  $("out").insertAdjacentHTML("beforeend", `<tr><td>Region confidence (p1000)</td><td>${(100 * res.p1000).toFixed(1)}%</td></tr>`);
+  if (res.truth) { L.circleMarker(res.truth, { radius: 7, color: "#000", fillColor: "#000", fillOpacity: 1 }).bindTooltip("truth").addTo(layer); pts.push(res.truth); }
+  map.fitBounds(L.latLngBounds(pts).pad(0.5), { maxZoom: 12 });
+}
+
+const drop = $("drop");
+drop.onclick = () => $("file").click();
+$("file").onchange = e => e.target.files[0] && run(e.target.files[0]);
+drop.ondragover = e => { e.preventDefault(); drop.classList.add("over"); };
+drop.ondragleave = () => drop.classList.remove("over");
+drop.ondrop = e => { e.preventDefault(); drop.classList.remove("over"); e.dataTransfer.files[0] && run(e.dataTransfer.files[0]); };
+document.onpaste = e => { const f = [...e.clipboardData.files].find(f => f.type.startsWith("image/")); f && run(f); };
+</script>
+</body>
+</html>

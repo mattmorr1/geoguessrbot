@@ -284,3 +284,82 @@ def test_pick_blocks_holds_out_a_fraction_per_continent():
     blk, cont = np.arange(1000), np.repeat([0, 1], 500)
     held, tune = pick_blocks(blk, cont)
     assert all(abs((cont[held] == c).sum() - HOLD_FRAC * 500) <= 1 for c in (0, 1)) and np.isin(tune, held).all()
+
+
+def test_nn_km_skips_holdout_rows_and_objectives_rank():
+    from types import SimpleNamespace
+
+    import eval as ev
+    env = SimpleNamespace(train={"lat": np.array([0.0, 0.0]), "lon": np.array([0.0, 1.0]), "holdout": np.array([False, True])})
+    env._seen_tree = ev.Env._seen_tree.func(env)
+    d = ev.Env.nn_km(env, np.array([0.0]), np.array([1.0]))
+    assert abs(d[0] - haversine(0, 0, 0, 1)) < 0.5
+    near, far = np.array([1.0, 30.0]), np.array([20.0, 20.0])
+    assert ev.OBJECTIVES["acc25"](far) > ev.OBJECTIVES["acc25"](near) and ev.OBJECTIVES["geoscore"](near) > ev.OBJECTIVES["geoscore"](far)
+
+
+def test_exif_gps_round_trip():
+    import io
+
+    from PIL import Image
+
+    from serve import exif_gps
+    img, buf = Image.new("RGB", (8, 8)), io.BytesIO()
+    ex = img.getexif()
+    ex.get_ifd(0x8825).update({1: "S", 2: (33.0, 51.0, 54.0), 3: "E", 4: (151.0, 12.0, 36.0)})
+    img.save(buf, "JPEG", exif=ex)
+    lat, lon = exif_gps(Image.open(io.BytesIO(buf.getvalue())))
+    assert abs(lat + 33.865) < 1e-3 and abs(lon - 151.21) < 1e-3 and exif_gps(Image.new("RGB", (8, 8))) is None
+
+
+def test_gate_switches_on_confidence_or_agreement():
+    from eval import gate
+    b2 = (np.array([0.0, 0.0, 0.0]), np.array([0.0, 0.0, 0.0]))
+    t2 = (np.array([1.0, 1.0, 0.01]), np.array([0.0, 0.0, 0.0]))
+    lat, _ = gate(b2, t2, np.array([0.9, 0.1, 0.1]), tau=0.5, delta=5)
+    assert lat.tolist() == [1.0, 0.0, 0.01]
+    assert gate(b2, t2, np.ones(3), tau=1.01, delta=0)[0].tolist() == [0.0, 0.0, 0.0]
+
+
+def test_rerank_features_and_scorer_shapes():
+    import rerank as rr
+    n, k = 3, rr.K
+    pts = torch.as_tensor(to_xyz(np.zeros(n * 4), np.linspace(0, 3, n * 4)), dtype=torch.float32).view(n, 4, 3)
+    hits = {m: (torch.zeros(n, k), pts[:, :1].expand(n, k, 3)) for m in ("B2", "T2")}
+    cells = (pts[:, 1:2].expand(n, rr.PRIOR_TOP, 3), torch.zeros(n, rr.PRIOR_TOP))
+    preds = {"B0": pts[:, 1], "B2": pts[:, 0], "T2": pts[:, 2]}
+    cand = pts[:, :1].expand(n, sum(rr.SRC_N), 3).contiguous()
+    C = sum(rr.SRC_N)
+    pq = {"top_idx": torch.arange(4).expand(n, 4), "top_lp": torch.tensor([-1.0, -2, -3, -4]).expand(n, 4),
+          "anc": np.zeros((5, 3), np.int64), "logn": torch.zeros(5), "lp1": torch.zeros(n, 2), "lp2": torch.zeros(n, 2)}
+    leafc = torch.full((n, C), 4).index_fill(1, torch.tensor([0]), 1)
+    loc, qf = rr.candidate_feats(cand, hits, cells, preds, torch.ones(n), torch.zeros(n, C), leafc, pq)
+    assert loc.shape == (n, C, 23) and qf.shape == (n, 7)
+    assert float(loc[0, 0, 16]) == -2 and float(loc[0, 1, 16]) == -4 and float(loc[..., 22].abs().max()) < 1e-2
+    assert torch.allclose(loc[..., 0].float(), torch.ones(1), atol=1e-3) and float(loc[..., 14].abs().max()) < 1e-2
+    x = rr.inputs({"loc": loc, "qf": qf}).flatten(0, 1)
+    s = rr.Scorer(x.shape[1], x.mean(0), x.std(0).clamp(min=1e-6)).to(device)(loc.to(device), qf.to(device))
+    assert s.shape == (n, sum(rr.SRC_N))
+
+
+def test_retrieve_streams_host_gallery_like_device_gallery():
+    import eval as ev
+    g = torch.Generator().manual_seed(0)
+    G, d, N, L, k = 300, 8, 20, 6, 5
+    vec = torch.nn.functional.normalize(torch.randn(G, d, generator=g), dim=-1).half()
+    leaf = torch.randint(0, L, (G,), generator=g)
+    qv = {"clip": torch.nn.functional.normalize(torch.randn(N, d, generator=g), dim=-1).half()}
+    top_lp, top_idx = torch.log_softmax(torch.randn(N, L, generator=g), 1).sort(1, descending=True)
+    prior = (top_idx[:, :4], top_lp[:, :4])
+    one = {"leaf": leaf.to(device), "vec": {"clip": vec.to(device)}}
+    host = {"leaf": leaf.to(device), "vec": {"clip": vec}}
+    for serve_k in (0, 2):
+        ref = retrieve(qv, prior, one, {"clip": 3.0}, L, k=k, serve_k=serve_k, gb=64)   # fp16 ties depend on gb
+        out = retrieve(qv, prior, host, {"clip": 3.0}, L, k=k, serve_k=serve_k, qb=7, gb=64)
+        assert torch.equal(ref[1], out[1]) and torch.equal(ref[0], out[0])
+    logn = torch.log(torch.bincount(leaf, minlength=L).clamp(min=1).float())
+    P = torch.full((N, L), -math.inf).scatter_(1, prior[0], prior[1] - logn[prior[0]])
+    s = 3.0 * (qv["clip"].float() @ vec.float().T) + P[:, leaf]
+    out = retrieve(qv, prior, host, {"clip": 3.0}, L, k=k, qb=7, gb=64)
+    assert torch.allclose(out[0], s.topk(k, 1).values, atol=2e-2)
+    assert ev.gallery_dev(4_900_000, 768) == "cpu" and ev.gallery_dev(1000, 64) == device

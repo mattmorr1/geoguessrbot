@@ -172,6 +172,17 @@ def test_folds():
     return np.load(path)
 
 
+def seq_holdout(mod=20):
+    """Official train rows whose sequence hash % mod == 0: leak-free reranker queries (no model or gallery sees them)."""
+    path = os.path.join(config.DATA_DIR, "meta", f"train_seqho{mod}.npy")
+    if not os.path.exists(path):
+        tr, meta = read_csv("train"), np.load(os.path.join(config.DATA_DIR, "meta", "train.npz"))
+        if not np.array_equal(tr["id"].to_numpy(), meta["id"]):
+            raise RuntimeError("train.csv no longer matches meta/train.npz; rebuild with bins.py build")
+        np.save(path, pd.util.hash_array(tr["sequence"].fillna("").to_numpy(object)) % mod == 0)
+    return np.load(path)
+
+
 def load(name):
     with np.load(os.path.join(config.META_DIR, f"{name}.npz")) as z:
         return {k: z[k] for k in z.files}

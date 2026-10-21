@@ -40,10 +40,11 @@ from model import device, load_bridge, pyramid_feats
 
 logger = logging.getLogger(__name__)
 
-THRESH_KM = (1, 25, 200, 750, 2500)
+THRESH_KM = (1, 5, 10, 25, 200, 750, 2500)
 TOP_M = 256          # leaves kept per query for the soft prior (mass beyond is negligible)
 SERVE_K = 32         # leaves sent to Milvus as a hard filter
 HITS = 64
+GPU_GALLERY_BYTES = 4 << 30   # larger gallery vectors stay in host RAM and stream through retrieve chunk by chunk
 KAPPAS = (2, 5, 10, 20, 40, 80, 160, 320, 640, 1280)
 ALPHAS = (0.0, 0.25, 0.5, 1.0)   # coarse-level weight in the leaf prior
 RADII = (0, 5, 25, 100)
@@ -71,6 +72,7 @@ def bootstrap(stat, *arrays, n=1000, seed=0):
     return [float(v) for v in np.percentile(vals, [2.5, 97.5])]
 
 
+OBJECTIVES = {"geoscore": lambda d: geoscore(d).mean(), "acc25": lambda d: (d <= 25).mean()}
 CO_PRIMARY = {"median_km": np.median, "geoscore": lambda x: geoscore(x).mean(), "acc_25km": lambda x: (x <= 25).mean()}
 
 
@@ -170,6 +172,10 @@ def normalize16(v, idx=None, dev=device, chunk=1 << 18):
     return out
 
 
+def gallery_dev(n, dim):
+    return device if n * dim * 2 <= GPU_GALLERY_BYTES else "cpu"
+
+
 @torch.no_grad()
 def _sim(qf, v, lo, hi):
     """qf @ v[lo:hi].T; gallery rows past len(v) (points without this feature, e.g. map points in BT2) score 0."""
@@ -186,38 +192,42 @@ def retrieve(qv, prior, gal, w, n_leaf, k=HITS, serve_k=0, qb=512, gb=1 << 18):
     Top-k hits per query. qv/gal['vec'] share feature keys; w maps key -> weight.
     prior: (top_idx, top_lp), a callable qsl -> dense [qb, n_leaf] additive term (count-normalized), or None.
     serve_k > 0 mimics Milvus: rank by sim inside the top serve_k leaves, then rescore.
+    Gallery chunks are the outer loop, so a host-resident gallery crosses to the GPU once per call.
     """
     leaf, G = gal["leaf"], len(gal["leaf"])
     logn = torch.log(torch.bincount(leaf, minlength=n_leaf).clamp(min=1).float())
     N = len(next(iter(qv.values())))
-    hit_s, hit_i = torch.empty(N, k), torch.empty(N, k, dtype=torch.long)
-    for qs in range(0, N, qb):
-        qsl = slice(qs, qs + qb)
-        q = {f: qv[f][qsl].to(device) for f in w}
-        P = None
+
+    def leaf_prior(qsl):
         if callable(prior):
             P = prior(qsl)
-            if serve_k:
-                P = torch.where(P >= P.topk(serve_k, 1).values[:, -1:], P, -math.inf)
-        elif prior is not None:
-            idx = prior[0][qsl, :serve_k or None].to(device).long()
-            P = torch.full((len(idx), n_leaf), -math.inf, device=device)
-            P.scatter_(1, idx, prior[1][qsl, :serve_k or None].to(device) - logn[idx])
-        bs = torch.full((len(q[next(iter(w))]), k), -math.inf, device=device)
-        bi = torch.zeros_like(bs, dtype=torch.long)
-        for gs in range(0, G, gb):
-            gsl = slice(gs, gs + gb)
-            s = sum(wt * _sim(q[f], gal["vec"][f], gs, min(gs + gb, G)) for f, wt in w.items())
+            return torch.where(P >= P.topk(serve_k, 1).values[:, -1:], P, -math.inf) if serve_k else P
+        if prior is None:
+            return None
+        idx = prior[0][qsl, :serve_k or None].to(device).long()
+        P = torch.full((len(idx), n_leaf), -math.inf, device=device)
+        return P.scatter_(1, idx, prior[1][qsl, :serve_k or None].to(device) - logn[idx])
+
+    hit_s = torch.full((N, k), -math.inf, device=device)
+    hit_i = torch.zeros((N, k), dtype=torch.long, device=device)
+    for gs in range(0, G, gb):
+        lf, chunk = leaf[gs:gs + gb], {f: gal["vec"][f][gs:gs + gb].to(device) for f in w}
+        for qs in range(0, N, qb):
+            qsl = slice(qs, qs + qb)
+            s = sum(wt * _sim(qv[f][qsl].to(device), chunk[f], 0, len(lf)) for f, wt in w.items())
+            P = leaf_prior(qsl)
             if P is not None:
-                pr = P.index_select(1, leaf[gsl])
+                pr = P.index_select(1, lf)
                 s = torch.where(torch.isfinite(pr), s, -math.inf) if serve_k else s + pr
             cs, ci = s.topk(min(k, s.shape[1]), dim=1)
-            bs, sel = torch.cat([bs, cs], 1).topk(k, dim=1)
-            bi = torch.cat([bi, ci + gs], 1).gather(1, sel)
-        if serve_k and P is not None:
-            bs = torch.where(torch.isfinite(bs), bs + P.gather(1, leaf[bi]), bs)
-        hit_s[qsl], hit_i[qsl] = bs.cpu(), bi.cpu()
-    return hit_s, hit_i
+            hit_s[qsl], sel = torch.cat([hit_s[qsl], cs], 1).topk(k, dim=1)
+            hit_i[qsl] = torch.cat([hit_i[qsl], ci + gs], 1).gather(1, sel)
+    if serve_k and prior is not None:
+        for qs in range(0, N, qb):
+            qsl = slice(qs, qs + qb)
+            bs = hit_s[qsl]
+            hit_s[qsl] = torch.where(torch.isfinite(bs), bs + leaf_prior(qsl).gather(1, leaf[hit_i[qsl]]), bs)
+    return hit_s.cpu(), hit_i.cpu()
 
 
 def refine(hit_s, hit_i, gal_xyz, radius_km, fallback):
@@ -236,19 +246,36 @@ def refine(hit_s, hit_i, gal_xyz, radius_km, fallback):
 
 class Env:
     """Lazily loaded meta, features, and galleries; queries come only from the test split.
-    feats picks the backbone(s); rows='common' restricts train/gallery/queries to rows every backbone encoded (bake-off)."""
+    feats picks the backbone(s); rows='common' restricts train/gallery/queries to rows every backbone encoded (bake-off).
+    holdout='seq' withholds a sequence-hash slice of official train from training and galleries (split 'trainho')."""
 
-    def __init__(self, ae_radius, feats="streetclip", rows="all"):
+    def __init__(self, ae_radius, feats="streetclip", rows="all", holdout=None):
         self.r, self.bbs = ae_radius, FEATS[feats]
         self.common = FEATS["fusion"] if rows == "common" else self.bbs
         self.cells = bins.load("cells")
         self.anc = self.cells["anc"]
         self.n_leaf = len(self.anc)
         self.train = bins.load("train")
+        if holdout == "seq":
+            if "holdout" in self.train:
+                raise SystemExit(f"SPLIT={config.SPLIT} already has a train holdout")
+            self.train["holdout"] = bins.seq_holdout()
         self.rows = self._rows("train")
         self.clip = bins.load_feats("train", self.rows, self.bbs)
         self.ae_train = self._ae("train")
         self.pyramid = None
+        self.min_km = 0.0
+
+    @functools.cached_property
+    def _seen_tree(self):
+        from scipy.spatial import cKDTree
+        seen = ~self.train["holdout"] if "holdout" in self.train else slice(None)
+        return cKDTree(bins.to_xyz(self.train["lat"][seen], self.train["lon"][seen]))
+
+    def nn_km(self, lat, lon):
+        """Great-circle km to the nearest non-held-out train row (photo or not)."""
+        chord, _ = self._seen_tree.query(bins.to_xyz(lat, lon), workers=-1)
+        return 2 * bins.R_EARTH_KM * np.arcsin(np.clip(chord / 2, 0, 1))
 
     def _rows(self, split):
         enc = [bins.encoded_rows(split, b) for b in self.common]
@@ -278,12 +305,21 @@ class Env:
         return torch.cat(out).numpy() if out else np.zeros((0, tower.out_dim), np.float16)
 
     def queries(self, split):
-        """val = test tune slice, test = the disjoint rest (split by sequence in bins.build); foldK = K-th hash fold."""
+        """val = test tune slice, test = the disjoint rest (split by sequence in bins.build); foldK = K-th hash fold;
+        trainho = encoded rows of the train holdout."""
+        if split == "trainho":
+            tr, pos = self.train, np.flatnonzero(self.train["holdout"][self.rows])
+            r = self.rows[pos]
+            return {"X": self.clip[pos], "lat": tr["lat"][r], "lon": tr["lon"][r], "cells": tr["cells"][r],
+                    "country": tr["country"][r], "land_cover": tr["aux_cat"][r, 2], "ae_true": None}
         meta, rows = bins.load("test"), self._rows("test")
         if split.startswith("fold"):
             rows = rows[bins.test_folds()[rows] == int(split[4:])]
         else:
             rows = rows[meta["tune"][rows] == (split == "val")]
+        if self.min_km:
+            rows = rows[self.nn_km(meta["lat"][rows], meta["lon"][rows]) > self.min_km]
+            logger.info("queries %s: %d beyond %.0f km of train", split, len(rows), self.min_km)
         X, ae = bins.load_feats("test", rows, self.bbs), self._ae("test")
         ae_true = None if ae is None else np.asarray(ae[rows], np.float32)
         return {"X": X, "lat": meta["lat"][rows], "lon": meta["lon"][rows], "cells": meta["cells"][rows],
@@ -311,9 +347,7 @@ class Env:
         if lvl in ("1", "2"):
             enc = np.zeros(len(ok), bool)
             enc[rows] = True
-            extra = np.flatnonzero(~enc & ok)
-            if not extra.size:
-                raise FileNotFoundError("photo-free (g1) AE not sampled")
+            extra = np.flatnonzero(~enc & ok)  # empty once every train row is encoded
             sel, src = np.concatenate([g0, extra]), np.r_[src, np.ones(len(extra), np.int8)]
         lat, lon, leaf = tr["lat"][sel], tr["lon"][sel], tr["cells"][sel, bins.LEAF]
         vec = (np.asarray(self.ae_train[sel]) if kind == "G" else self.embed(tower, "train", sel, lat, lon))
@@ -335,7 +369,9 @@ class Env:
         """src: 0 = encoded photo location, 1 = photo-free train location, 2 = grid point."""
         logger.info("gallery: %d points (%s) src counts %s", len(lat), ",".join(vec), np.bincount(src, minlength=3))
         return {"xyz": torch.as_tensor(bins.to_xyz(lat, lon), dtype=torch.float32), "lat": lat, "lon": lon, "src": src,
-                "leaf": to_dev(leaf, torch.long), "vec": {k: normalize16(v, idx) for k, (v, idx) in vec.items()}}
+                "leaf": to_dev(leaf, torch.long),
+                "vec": {k: normalize16(v, idx, gallery_dev(len(v) if idx is None else len(idx), v.shape[1]))
+                        for k, (v, idx) in vec.items()}}
 
 
 # ── Methods ───────────────────────────────────────────────────────────────────
@@ -365,6 +401,10 @@ def method_hits(name, q, gal, qv, p, env, serve_k=0):
     return retrieve(qv, prior, gal, {"ae" if name[0] == "G" else "loc": p["kappa"]}, env.n_leaf, serve_k=serve_k)
 
 
+def query_vecs(q, X):
+    return {"ae": q["ae"], "loc": q["loc"], "clip": normalize16(X), "flag": torch.ones(len(X), 1, dtype=torch.float16)}
+
+
 def mixed_prior(q, p, env, gal):
     """(1-beta) [log p_level(cell) - log n_cell] + beta [log p_leaf - log n_leaf] per leaf, n = gallery points.
     Leaves outside the query's top-M leaf list take its M-th log prob."""
@@ -385,15 +425,17 @@ def cell_centroid(env, leaf):
     return env.cells[f"lat_{bins.LEAF}"][leaf], env.cells[f"lon_{bins.LEAF}"][leaf]
 
 
-def tune(model, ck, env, run_dir, only=None, val="val"):
-    """Val-only grid: prior alpha by B0 GeoScore, then each method keeps the (weight, R) maximizing val GeoScore."""
-    Q = env.queries(val)
-    b0_gs = lambda q: float(geoscore(bins.haversine(Q["lat"], Q["lon"], *cell_centroid(env, q["b0"].numpy()))).mean())
-    by_alpha = {a: b0_gs(encode_queries(model, Q["X"], env.anc, m=1, alpha=a)) for a in ALPHAS}
+def tune(model, ck, env, run_dir, only=None, val="val", objective="geoscore"):
+    """Val-only grid: prior alpha by B0 objective, then each method keeps the (weight, R) maximizing the val objective."""
+    Q, obj = env.queries(val), OBJECTIVES[objective]
+    tag = {"objective": objective, "min_km": env.min_km}
+    b0_d = lambda q: bins.haversine(Q["lat"], Q["lon"], *cell_centroid(env, q["b0"].numpy()))
+    d_alpha = {a: b0_d(encode_queries(model, Q["X"], env.anc, m=1, alpha=a)) for a in ALPHAS}
+    by_alpha = {a: float(obj(d)) for a, d in d_alpha.items()}
     alpha = max(by_alpha, key=by_alpha.get)
-    logger.info("prior alpha -> B0 val GeoScore %s; using alpha=%s", by_alpha, alpha)
+    logger.info("prior alpha -> B0 val %s %s; using alpha=%s", objective, by_alpha, alpha)
     q = encode_queries(model, Q["X"], env.anc, alpha=alpha)
-    qv = {"ae": q["ae"], "loc": q["loc"], "clip": normalize16(Q["X"]), "flag": torch.ones(len(Q["X"]), 1, dtype=torch.float16)}
+    qv = query_vecs(q, Q["X"])
     methods = (["B1", "B2"] + (["G0", "G1", "G2", "Fused", "HG2"] if ck["args"]["w_ae"] > 0 else [])
                + (["T0", "T2", "HT2", "UT2", "BT2"] if model.tower is not None else []))
     methods = [m for m in methods if not only or m in only]
@@ -420,9 +462,10 @@ def tune(model, ck, env, run_dir, only=None, val="val"):
             hs, hi = method_hits(m, q, gal, qv, p, env)
             for r in RADII:
                 lat, lon = refine(hs, hi, gal["xyz"], r, fb)
-                gs = float(geoscore(bins.haversine(Q["lat"], Q["lon"], lat, lon)).mean())
-                if gs > best.get(m, {}).get("val_geoscore", -1):
-                    best[m] = {**p, "radius_km": r, "val_geoscore": gs}
+                d = bins.haversine(Q["lat"], Q["lon"], lat, lon)
+                s = float(obj(d))
+                if s > best.get(m, {}).get("val_obj", -1):
+                    best[m] = {**p, "radius_km": r, "val_obj": s, "val_geoscore": float(geoscore(d).mean()), **tag}
         if m in DIAG:
             best[m]["ae_diag"] = ae_diag(q, Q, env, gal, DIAG[m])
         logger.info("tuned %s: %s", m, best[m])
@@ -430,7 +473,8 @@ def tune(model, ck, env, run_dir, only=None, val="val"):
             logger.warning("%s: %s=%s is on the grid edge; the optimum may lie outside", m, key, best[m][key])
         del gal
         torch.cuda.empty_cache()
-    best["B0"] = {"val_geoscore": by_alpha[alpha], "alpha": alpha, "by_alpha": by_alpha}
+    best["B0"] = {"val_obj": by_alpha[alpha], "val_geoscore": float(geoscore(d_alpha[alpha]).mean()), "alpha": alpha,
+                  "by_alpha": by_alpha, **tag}
     json.dump(best, open(os.path.join(run_dir, "tuned.json"), "w"), indent=2)
     return best
 
@@ -500,6 +544,7 @@ def regions(model, ck, env, run_dir, split="val", levels=(2, bins.TEST_L)):
 
 def stratify(d, keys):
     return {name: {str(k): {"n": int((v == k).sum()), "median_km": float(np.median(d[v == k])),
+                            "acc_25km": float((d[v == k] <= 25).mean()),
                             "geoscore": float(geoscore(d[v == k]).mean())}
                    for k in np.unique(v)} for name, v in keys.items()}
 
@@ -507,7 +552,7 @@ def stratify(d, keys):
 def predict(model, env, Q, tuned):
     """(lat, lon) per tuned method on queries Q, plus B0."""
     q = encode_queries(model, Q["X"], env.anc, alpha=tuned["B0"]["alpha"])
-    qv = {"ae": q["ae"], "loc": q["loc"], "clip": normalize16(Q["X"]), "flag": torch.ones(len(Q["X"]), 1, dtype=torch.float16)}
+    qv = query_vecs(q, Q["X"])
     preds = {"B0": cell_centroid(env, q["b0"].numpy())}
     for m, p in tuned.items():
         if m in GALLERY_OF:
@@ -516,6 +561,61 @@ def predict(model, env, Q, tuned):
             del gal
             torch.cuda.empty_cache()
     return preds
+
+
+GATE_TAUS = (0.0, 0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.01)   # 1.01 disables the confidence arm
+GATE_DELTAS = (0, 5, 10, 25, 50, 100)                                        # 0 disables the agreement arm
+
+
+def gate(b2, t2, p1000, tau, delta):
+    """T2 where the prior is confident in the TEST_LEVEL cell or B2 and T2 agree within delta km, else B2."""
+    use = (p1000 >= tau) | (bins.haversine(*b2, *t2) <= delta)
+    return np.where(use, t2[0], b2[0]), np.where(use, t2[1], b2[1])
+
+
+def gate_cfg(run_dir):
+    """B2 as tuned (GeoScore); T2 keeps its tuned kappa but R=0, so it stays sharp."""
+    tuned = json.load(open(os.path.join(run_dir.split("@")[0], "tuned.json")))
+    return {"B0": tuned["B0"], "B2": tuned["B2"], "T2": {**tuned["T2"], "radius_km": 0}}
+
+
+def gate_eval(model, ck, env, run_dir):
+    """Tune (tau, delta) on val: max acc@25km subject to GeoScore >= B2; then one test pass incl. the >25 km subset."""
+    cfg, out = gate_cfg(run_dir), {}
+    for split in ("val", "test"):
+        Q = env.queries(split)
+        p1000 = encode_queries(model, Q["X"], env.anc, alpha=cfg["B0"]["alpha"])["p1000"].numpy()
+        pr = predict(model, env, Q, cfg)
+        dist = lambda ll: bins.haversine(Q["lat"], Q["lon"], *ll)
+        if split == "val":
+            floor = geoscore(dist(pr["B2"])).mean()
+            grid = [(t, dl, dist(gate(pr["B2"], pr["T2"], p1000, t, dl))) for t in GATE_TAUS for dl in GATE_DELTAS]
+            ok = [g for g in grid if geoscore(g[2]).mean() >= floor]
+            tau, delta, dv = max(ok or grid, key=lambda g: ((g[2] <= 25).mean(), geoscore(g[2]).mean()))
+            out["gate"] = {"tau": tau, "delta": delta, "feasible": bool(ok), "val_b2_geoscore": float(floor),
+                           "val_geoscore": float(geoscore(dv).mean()), "val_acc25": float((dv <= 25).mean())}
+            logger.info("gate tuned on val: %s", out["gate"])
+            continue
+        d = {m: dist(pr[m]) for m in ("B0", "B2", "T2")} | {"GATE": dist(gate(pr["B2"], pr["T2"], p1000, tau, delta))}
+        nn = env.nn_km(Q["lat"], Q["lon"])
+        beat = lambda a, b, n: (b < n).mean() - (a < n).mean()
+        sub_res = {}
+        for name, m in (("all", np.ones(len(nn), bool)), ("far25", nn > 25)):
+            sub_res[name] = {"n": int(m.sum()),
+                             "methods": {k: {**distance_metrics(v[m]), "beat_oracle": float((v[m] < nn[m]).mean())} for k, v in d.items()},
+                             "paired_vs_B2": {k: {**{c: bootstrap(lambda x, y, f=f: f(y) - f(x), d["B2"][m], v[m])
+                                                     for c, f in CO_PRIMARY.items()}, "beat_oracle": bootstrap(beat, d["B2"][m], v[m], nn[m])}
+                                              for k, v in d.items() if k != "B2"},
+                             "gate_use_rate": float(((p1000 >= tau) | (bins.haversine(*pr["B2"], *pr["T2"]) <= delta))[m].mean())}
+        out["test"] = sub_res
+    g, f = out["test"]["all"]["paired_vs_B2"]["GATE"], out["test"]["far25"]["paired_vs_B2"]
+    out["criteria"] = {"geoscore_not_worse": g["geoscore"][1] >= 0,
+                       "keeps_half_t2_oracle_gain_far": out["test"]["far25"]["methods"]["GATE"]["beat_oracle"] - out["test"]["far25"]["methods"]["B2"]["beat_oracle"]
+                       >= 0.5 * (out["test"]["far25"]["methods"]["T2"]["beat_oracle"] - out["test"]["far25"]["methods"]["B2"]["beat_oracle"]),
+                       "far_gate_vs_b2": f["GATE"]}
+    json.dump(out, open(os.path.join(run_dir, "gate.json"), "w"), indent=2, default=float)
+    logger.info("gate result: %s", json.dumps({k: out[k] for k in ("gate", "criteria")}, default=float))
+    return out
 
 
 def crossfit(model, ck, env, run_dir, only=None):
@@ -552,7 +652,7 @@ def test(model, ck, env, run_dir):
     tuned = json.load(open(os.path.join(run_dir, "tuned.json")))
     Q = env.queries("test")
     q = encode_queries(model, Q["X"], env.anc, alpha=tuned["B0"]["alpha"])
-    qv = {"ae": q["ae"], "loc": q["loc"], "clip": normalize16(Q["X"]), "flag": torch.ones(len(Q["X"]), 1, dtype=torch.float16)}
+    qv = query_vecs(q, Q["X"])
     fb = cell_centroid(env, q["b0"].numpy())
     hier = encode_queries(model, Q["X"], env.anc, m=1, alpha=1.0)["b0"].numpy()
     preds, diag = {"B0": fb, "B0-hier": cell_centroid(env, hier), "B0-flat": cell_centroid(env, q["flat"].numpy())}, {}
@@ -569,15 +669,13 @@ def test(model, ck, env, run_dir):
         del gal
         torch.cuda.empty_cache()
 
-    from scipy.spatial import cKDTree
-    seen = ~env.train["holdout"] if "holdout" in env.train else slice(None)
-    chord, _ = cKDTree(bins.to_xyz(env.train["lat"][seen], env.train["lon"][seen])).query(bins.to_xyz(Q["lat"], Q["lon"]), workers=-1)
-    nn_km = 2 * bins.R_EARTH_KM * np.arcsin(np.clip(chord / 2, 0, 1))
+    nn_km = env.nn_km(Q["lat"], Q["lon"])
     dens = env.cells[f"count_{bins.TEST_L}"][np.maximum(Q["cells"][:, bins.TEST_L], 0)]
     strata = {"continent": np.array([CC_TO_CONTINENT_NAME.get(c, "Unknown") for c in Q["country"]]),
               "land_cover": Q["land_cover"],
               "density_decile": np.searchsorted(np.quantile(dens, np.linspace(0, 1, 11)[1:-1]), dens),
-              "nn_train_km": np.digitize(nn_km, [1, 5, 10, 25, 50, 100])}
+              "nn_train_km": np.digitize(nn_km, [1, 5, 10, 25, 50, 100]),
+              "region_correct": env.anc[q["b0"].numpy(), bins.TEST_L] == Q["cells"][:, bins.TEST_L]}
     gt_admin = admin_labels(Q["lat"], Q["lon"])
     dists = {m: bins.haversine(Q["lat"], Q["lon"], *ll) for m, ll in preds.items()}
     base = dists.get("B2")
@@ -609,7 +707,7 @@ def test(model, ck, env, run_dir):
 
 
 def summary_md(name, res):
-    cols = ["median_km", "geoscore", "acc_1km", "acc_25km", "acc_200km", "acc_750km", "acc_2500km", "acc_country", "acc_admin1"]
+    cols = ["median_km", "geoscore", "acc_1km", "acc_5km", "acc_10km", "acc_25km", "acc_200km", "acc_750km", "acc_2500km", "acc_country", "acc_admin1"]
     lines = [f"## {name} (test n={res['n_test']})", "", "| method | " + " | ".join(cols)
              + " | GeoScore 95% CI | vs B2: dGeoScore | d acc@25km (pt) | d median km |", "|---" * (len(cols) + 5) + "|"]
     for m, r in res["methods"].items():
@@ -695,6 +793,8 @@ def report():
     for t in runs:
         run = os.path.basename(os.path.dirname(t))
         tuned = json.load(open(t))
+        if any(p.get("objective", "geoscore") != "geoscore" or p.get("min_km") for p in tuned.values()):
+            continue
         for m, p in tuned.items():
             rows.append((run, m, p["val_geoscore"]))
             if (m in SERVABLE and not run.startswith("pilot")
@@ -717,12 +817,14 @@ def report():
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("cmd", choices=["tune", "test", "parity", "report", "regions", "crossfit"])
+    ap.add_argument("cmd", choices=["tune", "test", "parity", "report", "regions", "crossfit", "gate"])
     ap.add_argument("--split", choices=["val", "test"], default="val", help="regions only")
     ap.add_argument("ckpt", nargs="?")
     ap.add_argument("-n", type=int, default=200)
     ap.add_argument("--prior-ckpt", help="cell logits from this model, AE from ckpt (decoupled scoring)")
     ap.add_argument("--methods", help="comma list: tune only these (B0 always); pair with --tag to keep the full run intact")
+    ap.add_argument("--objective", choices=list(OBJECTIVES), default="geoscore", help="tune selection metric")
+    ap.add_argument("--min-km", type=float, default=0.0, help="keep queries farther than this from any train row")
     ap.add_argument("--tag", help="write to <run_dir>@<tag> instead of the checkpoint's run dir")
     a = ap.parse_args()
     if a.cmd == "report":
@@ -731,19 +833,21 @@ def main():
         ap.error(f"{a.cmd} needs a checkpoint path")
     model, ck = load_bridge(a.ckpt)
     data = lambda c: (c["args"].get("feats", "streetclip"), c["args"].get("rows", "all"))
-    env, run_dir = Env(ck["args"]["ae_radius"], *data(ck)), os.path.dirname(os.path.abspath(a.ckpt))
+    env = Env(ck["args"]["ae_radius"], *data(ck), holdout=ck["args"].get("holdout"))
+    run_dir = os.path.dirname(os.path.abspath(a.ckpt))
     if a.prior_ckpt:
         prior, pck = load_bridge(a.prior_ckpt)
         if data(pck) != data(ck):
             raise SystemExit(f"--prior-ckpt was trained on {data(pck)}, ckpt on {data(ck)}: features differ")
         model = Decoupled(prior, model)
         run_dir += "_prior-" + os.path.basename(os.path.dirname(os.path.abspath(a.prior_ckpt)))
+    env.min_km = a.min_km
     if a.tag:
         run_dir += "@" + a.tag
     os.makedirs(run_dir, exist_ok=True)
     only = set(a.methods.split(",")) if a.methods else None
-    {"tune": lambda *x: tune(*x, only), "test": test, "regions": lambda *x: regions(*x, a.split),
-     "crossfit": lambda *x: crossfit(*x, only),
+    {"tune": lambda *x: tune(*x, only, objective=a.objective), "test": test, "regions": lambda *x: regions(*x, a.split),
+     "crossfit": lambda *x: crossfit(*x, only), "gate": gate_eval,
      "parity": lambda *x: parity(*x, a.n)}[a.cmd](model, ck, env, run_dir)
 
 
