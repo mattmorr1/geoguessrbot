@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 """
-Ingest: stream OSV5M zips -> frozen StreetCLIP embeddings (fp16 shards), and load the serving gallery into Milvus.
+Ingest: stream OSV5M zips -> frozen StreetCLIP / SigLIP 2 embeddings (fp16 shards).
 
 Usage:
   python ingest.py encode --split train --zip-start 0 --zip-end 40
   python ingest.py encode --split test  --zip-end 5
   python ingest.py encode --split train --zip-end 4 --backbone siglip2   # alternate encoder, own shards
-  python ingest.py milvus     # gallery named in results/best_config.json -> Milvus + data/serve/leaf_counts.npy
 
 Encoding progress is saved to data/ingest_checkpoint.json so re-runs skip completed zips.
 """
@@ -91,7 +90,7 @@ def get_all_images(directory: str) -> list[str]:
 # ── Encoding ──────────────────────────────────────────────────────────────────
 
 class ImageFiles(Dataset):
-    """CLIPImageProcessor runs in DataLoader workers, so preprocessing parity with predict.py is exact."""
+    """CLIPImageProcessor runs in DataLoader workers, so preprocessing parity with serve.py is exact."""
 
     def __init__(self, paths, processor):
         self.paths, self.processor = paths, processor
@@ -146,82 +145,11 @@ def run_encode(split: str, zip_names: list[str], state: dict, backbone: str) -> 
                     split, name, len(ids), bad, len(ids) / (time.time() - t0))
 
 
-# ── Milvus serving gallery ────────────────────────────────────────────────────
-
-def setup_collection(client, reset: bool = True) -> None:
-    from pymilvus import DataType
-    if client.has_collection(config.MILVUS_COLLECTION):
-        if not reset:
-            return
-        logger.warning("Dropping collection '%s'", config.MILVUS_COLLECTION)
-        client.drop_collection(config.MILVUS_COLLECTION)
-
-    schema = client.create_schema(auto_id=True, enable_dynamic_field=False)
-    schema.add_field("id",           DataType.INT64, is_primary=True)
-    schema.add_field("ae_vec",       DataType.FLOAT_VECTOR, dim=64)
-    schema.add_field("lat",          DataType.DOUBLE)
-    schema.add_field("lon",          DataType.DOUBLE)
-    schema.add_field("leaf",         DataType.INT32)
-    schema.add_field("src",          DataType.INT8)
-    schema.add_field("country_code", DataType.VARCHAR, max_length=8)
-
-    idx = client.prepare_index_params()
-    idx.add_index("ae_vec", "HNSW", "COSINE", params={"M": 16, "efConstruction": 200})
-    idx.add_index("leaf", "INVERTED")
-    client.create_collection(config.MILVUS_COLLECTION, schema=schema, index_params=idx)
-    logger.info("Collection '%s' created", config.MILVUS_COLLECTION)
-
-
-def insert_with_retry(client, records: list[dict]) -> None:
-    for attempt in range(1, config.MAX_INSERT_RETRIES + 1):
-        try:
-            client.insert(collection_name=config.MILVUS_COLLECTION, data=records)
-            return
-        except Exception as e:
-            if attempt == config.MAX_INSERT_RETRIES:
-                raise
-            logger.warning("Milvus insert attempt %d/%d failed: %s", attempt, config.MAX_INSERT_RETRIES, e)
-            time.sleep(2 ** attempt)
-
-
-def load_milvus() -> None:
-    """Loads exactly eval.Env.gallery(cfg['gallery']) so serving and eval share one gallery definition."""
-    import reverse_geocoder as rg
-    from pymilvus import MilvusClient
-    import eval as ev
-
-    cfg = json.load(open(os.path.join(config.RESULTS_DIR, "best_config.json")))
-    if cfg["field"] != "ae_vec":
-        raise SystemExit(f"serving field {cfg['field']} not supported by the v2 schema (Gate B fallback)")
-    radius = torch.load(cfg["ckpt"], map_location="cpu", weights_only=False)["args"]["ae_radius"]
-    env = ev.Env(radius)
-    gal = env.gallery(cfg["gallery"])
-    ae, leaf = gal["vec"]["ae"].float().cpu().numpy(), gal["leaf"].cpu().numpy()
-    cc = np.array([r["cc"] for r in rg.search(list(zip(gal["lat"], gal["lon"])), verbose=False)])
-
-    client = MilvusClient(uri=config.MILVUS_URI, token=config.MILVUS_TOKEN)
-    if config.MILVUS_DB not in client.list_databases():
-        client.create_database(config.MILVUS_DB)
-    client = MilvusClient(uri=config.MILVUS_URI, token=config.MILVUS_TOKEN, db_name=config.MILVUS_DB)
-    setup_collection(client, reset=True)
-    for s in tqdm(range(0, len(leaf), config.MILVUS_BATCH), desc="milvus"):
-        sl = slice(s, s + config.MILVUS_BATCH)
-        insert_with_retry(client, [
-            {"ae_vec": v, "lat": float(la), "lon": float(lo), "leaf": int(lf), "src": int(sr), "country_code": c}
-            for v, la, lo, lf, sr, c in zip(ae[sl].tolist(), gal["lat"][sl], gal["lon"][sl], leaf[sl], gal["src"][sl], cc[sl])])
-    client.flush(config.MILVUS_COLLECTION)
-    client.load_collection(config.MILVUS_COLLECTION)
-
-    os.makedirs(config.SERVE_DIR, exist_ok=True)
-    np.save(os.path.join(config.SERVE_DIR, "leaf_counts.npy"), np.bincount(leaf, minlength=env.n_leaf))
-    logger.info("Milvus: %d gallery points loaded into %s", len(leaf), config.MILVUS_COLLECTION)
-
-
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("cmd", choices=["encode", "milvus"])
+    parser.add_argument("cmd", choices=["encode"])
     parser.add_argument("--split", choices=["train", "test"], default="train")
     parser.add_argument("--zip-start", type=int, default=0, help="First zip index, inclusive")
     parser.add_argument("--zip-end",   type=int, default=1, help="Last zip index, exclusive")
@@ -237,9 +165,6 @@ def main() -> None:
             logging.FileHandler(os.path.join(config.LOG_DIR, "ingest.log")),
         ],
     )
-
-    if args.cmd == "milvus":
-        return load_milvus()
 
     os.makedirs(config.TEMP_DIR, exist_ok=True)
     state = load_checkpoint(config.INGEST_CHECKPOINT)

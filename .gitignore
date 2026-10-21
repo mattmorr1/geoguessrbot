@@ -220,3 +220,7 @@ data/
 runs/
 logs/
 target/
+
+# local tooling indexes
+.slop/
+index.scip

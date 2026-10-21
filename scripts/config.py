@@ -6,10 +6,6 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 # ── Infrastructure ──────────────────────────────────────────────────────────
 
-MILVUS_URI        = os.getenv("MILVUS_URI",   "http://localhost:19530")
-MILVUS_TOKEN      = os.getenv("MILVUS_TOKEN", "root:Milvus")
-MILVUS_DB         = os.getenv("MILVUS_DB",    "geoguessr")
-MILVUS_COLLECTION = os.getenv("MILVUS_COLLECTION", "world_locations_v2")
 
 # ── Paths ────────────────────────────────────────────────────────────────────
 
@@ -21,7 +17,6 @@ SPLIT             = os.getenv("SPLIT", "official")
 _NS               = "" if SPLIT == "official" else f"_{SPLIT}"
 META_DIR          = os.path.join(DATA_DIR, "meta" + _NS)
 FEAT_DIR          = os.path.join(DATA_DIR, "feats")
-SERVE_DIR         = os.path.join(DATA_DIR, "serve")
 RUNS_DIR          = os.getenv("RUNS_DIR",    os.path.join(ROOT, "runs" + _NS))
 RESULTS_DIR       = os.getenv("RESULTS_DIR", os.path.join(ROOT, "results" + _NS))
 LOG_DIR           = os.path.join(ROOT, "logs")
@@ -41,8 +36,6 @@ GRID_YEAR = 2020
 ENCODE_BATCH       = int(os.getenv("ENCODE_BATCH",       "64"))
 ENCODE_WORKERS     = int(os.getenv("ENCODE_WORKERS",     "12"))
 MAX_BUFFERED_ZIPS  = int(os.getenv("MAX_BUFFERED_ZIPS",  "2"))
-MAX_INSERT_RETRIES = int(os.getenv("MAX_INSERT_RETRIES", "3"))
-MILVUS_BATCH       = int(os.getenv("MILVUS_BATCH",       "5000"))
 
 # ── AlphaEarth (public COG mirror; Earth Engine point sampling costs ~2.3 EECU-s/pt) ─────────
 

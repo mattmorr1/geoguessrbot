@@ -303,7 +303,7 @@ def load_bridge(path, map_location=device):
 
 
 # ============================================================
-# Frozen StreetCLIP (shared by ingest and predict so features match exactly)
+# Frozen StreetCLIP (shared by ingest and serve so features match exactly)
 # ============================================================
 
 def load_streetclip(dev=device):

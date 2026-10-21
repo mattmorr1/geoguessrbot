@@ -2,18 +2,16 @@
 
 ## Thesis
 
-Global street-view geolocation as a **product of experts**:
+Street-view geolocation as **retrieve, then rerank**, with no language model anywhere:
 
-```
-p(location j | image) ∝ p(leaf_j | image) / n_leaf_j  ×  exp(kappa · cos(ae_hat(image), ae_j))
-```
+1. A **cell prior**: a hierarchical posterior over the nested OSV5M quadtree.
+2. Two **retrieval experts** under that prior: kNN over train photos (B2), and a two-tower match between the image
+   and a learned embedding of AlphaEarth satellite context at candidate locations (T2).
+3. A **reranker** that picks one location from the pooled candidates, maximizing expected GeoScore.
 
-- **Cell prior**: a hierarchical posterior over the nested OSV5M quadtree (the binned dataset).
-- **Satellite likelihood**: a vMF term in AlphaEarth space, a *fixed, physically grounded* 64d embedding field
-  available at every 10 m land pixel. The image encoder learns to predict it (privileged-information distillation).
-
-Because the location key is a satellite field rather than a learned GPS encoder (GeoCLIP) or a photo gallery
-(PIGEON / OSV5M hybrid), the gallery can contain locations that were never photographed.
+AlphaEarth (`GOOGLE/SATELLITE_EMBEDDING/V1/ANNUAL`) is a fixed, physically grounded 64d field available at every
+10 m land pixel, so the T2 gallery includes locations nobody photographed. That is where it earns its keep: on test
+photos more than 25 km from any train photo the reranker gains 95-116 GeoScore over B2.
 
 ## Data: the binned dataset
 
@@ -25,83 +23,102 @@ OSV5M `train.csv` ships seven quadtree bin levels, `quadtree_10_{50000,25000,125
 | cells | 268 | 498 | 1,065 | 2,788 | 5,304 | 11,399 | 18,201 |
 
 `test.csv` (210,122 rows, the official benchmark) carries only level 1000; coarser labels come from the parent map.
-Cell centroids are spherical means over all train rows. Validation = 10% of official test **sequences** (hashed);
-the disjoint 90% is the reported test. Train-side holdouts were rejected: OSV5M test sits much farther from train
-(median nearest-train 5.6 km vs 1.4 km for a 1 km-buffered train val). Zip membership is uniform-random over
-geography, so zips 00–39 (2.0M images) are an unbiased subsample.
+Cell centroids are spherical means over all train rows. Validation = 10% of official test **sequences** (hashed,
+fold 0); the disjoint folds 1-9 are the reported test. Train-side holdouts were rejected: OSV5M test sits much
+farther from train (median nearest-train 4.4 km for val queries vs 0.3 km for a sequence-held-out train slice), so
+a scorer fit on train-side queries learns to over-trust near-duplicate neighbours. Zip membership is uniform-random
+over geography, so zips 00-39 (2.0M images) are an unbiased subsample.
 
-Per-image OSV5M attributes (`drive_side`, Köppen `climate`, `land_cover`, `soil`, `road_index`, `dist_sea`)
-are auxiliary targets.
+`SPLIT=blocks` builds an alternative split whose test regions are spatially held out from train (used by the demo).
 
 ## Features
 
-- **StreetCLIP** (ViT-L/14-336, frozen): `image_embeds` stored as fp16 memmaps (`data/feats/clip_{split}.npy`),
-  aligned to metadata rows. The same `load_streetclip` / `CLIPImageProcessor` path is used by `predict.py`.
-- **AlphaEarth V1** (`GOOGLE/SATELLITE_EMBEDDING/V1/ANNUAL`), read from the public COG mirror on Source
-  Cooperative instead of Earth Engine: point sampling cost ~2.3 EECU-s/point, so the ~8M points would need
-  ~5,100 EECU-hours against a 150 EECU-hour/month noncommercial quota. One year (2020) for every point keeps the
-  transfer at ~320 GB. Targets come from each tile's 80 m overview (Google's dequantize-sum-normalize pooling,
-  verified at cos 0.9999 against pooling the 10 m pixels; cos 0.94 to the 10 m point itself) and 2x2 / 4x4
-  pools of it (160 / 320 m); the pilot picks the scale.
-  Missing pixels are NaN and masked out of every loss.
+- **Images**: StreetCLIP (ViT-L/14-336) and SigLIP 2 (so400m-patch14-384), both frozen, stored as fp16 memmaps
+  aligned to metadata rows. `fusion768` is a PCA-768 of the concatenated unit-normalized embeddings, fit on train.
+  `serve.py` encodes uploads through the same `encode_pixels` path as `ingest.py`.
+- **AlphaEarth**, read from the public COG mirror on Source Cooperative instead of Earth Engine (point sampling the
+  ~8M points would need ~5,100 EECU-hours against a 150/month noncommercial quota). One year (2020) for every point
+  keeps transfer at ~320 GB. Per point: pooled context at 80/160/320 m (Google's dequantize-sum-normalize pooling,
+  cos 0.9999 against pooling the 10 m pixels) and a coarse cell pyramid. Missing pixels are NaN and masked.
 
 ## Model (`model.py`)
 
 ```
-StreetCLIP 768d -> L2 norm -> EmbeddingAugmentor -> SharedEncoder (768 -> 1024 -> 512, residual)
-  ├── CellHead   (7 levels)   linear | euclid | lorentz
-  ├── PhysicalHead            512 -> 256 -> 64, L2-normalized (predicted AlphaEarth)
-  └── AuxHeads                4 categorical + 2 regression
+fusion768 -> L2 norm -> SharedEncoder (768 -> 1024 -> 512, residual)
+  ├── CellHead   (7 levels, linear)              haversine-smoothed CE per level
+  └── loc_head   512 -> tower dim                 InfoNCE against LocationTower(AlphaEarth context + pyramid)
 ```
 
-**Cell head arms** share one logits interface:
-- `linear`: one linear layer per level (baseline).
-- `euclid`: prototypes with a tree parametrization `e_child = e_parent + delta_child`, logits `-s·||h - e||²`.
-- `lorentz`: the same parametrization mapped to the Lorentz hyperboloid by `expmap0`, logits `-s·d_L(h, e)`,
-  computed in FP32 with norm clipping. `lorentz` vs `euclid` isolates curvature from the tree structure.
+- Cells: per-level CE against `q_c = softmax(-d(x, centroid_c) / tau_l)`, `tau_l` = median member-to-centroid
+  distance at that level (PIGEON-style).
+- Two-tower: the image embedding is matched to `LocationTower(ae context, cell pyramid)` of the photo's own location
+  with geodesic soft targets (`--loc-tau-km`), so near-duplicate locations are not hard negatives.
+- `f1` trains the prior only (`--loc none`); `ft` adds the tower (`--loc ae+pyr`). The AlphaEarth regression and
+  auxiliary-attribute heads exist (`--w-ae`, `--w-aux`) but are off in the headline runs.
 
-**Losses**
-- Cells: per-level CE against haversine-smoothed labels `q_c = softmax(-d(x, centroid_c) / tau_l)`, with
-  `tau_l` = median member-to-centroid distance at that level (PIGEON-style).
-- AlphaEarth: InfoNCE with a queue of recent targets; `--target-tau > 0` replaces one-hot labels with
-  `softmax(t_i·t_j / tau_t)` so near-duplicate targets on the same road are not treated as negatives.
-- Aux: CE (ignore missing) + smooth-L1 on standardized regression targets.
+Training streams host-resident features to the GPU per batch (batches of 2048), fp16 autocast, AdamW, warmup +
+cosine, EMA weights, early stopping on validation GeoScore.
 
-**Training**: the whole train set lives on the GPU (2M × 768 fp16 = 3.1 GB), batches of 2048 by random index,
-fp16 autocast (Turing has no bf16), AdamW, warmup + cosine, EMA weights, early stopping on validation GeoScore.
-
-## Inference and evaluation (`eval.py`)
+## Retrieval (`eval.py`)
 
 1. **Leaf posterior**: `log p(leaf) = Σ_l log p_l(anc_l(leaf))`, renormalized over leaves; keep the top 256.
-2. **Retrieval**: exact chunked GEMM over a GPU-resident gallery, adding the cell prior `log p(leaf) - log n_leaf`
-   to `kappa · cos` for every gallery point. No ANN, so ANN recall never confounds a result.
+2. **Retrieval**: exact chunked GEMM, adding `log p(leaf) - log n_leaf` to the weighted similarity of every gallery
+   point. Galleries above 4 GB stay on the host and stream through the GPU chunk by chunk. No ANN, so ANN recall
+   never confounds a result.
 3. **Refinement**: score-weighted spherical mean of hits within R km of the best hit.
 
-| method | description |
+| method | score per gallery point |
 |---|---|
-| B0 / B0-flat | argmax leaf centroid (hierarchical / finest head only) |
-| B1 | training-free StreetCLIP kNN over the train photos |
-| B2 | cell prior + StreetCLIP kNN (the strongest classical baseline) |
-| G0 / G1 / G2 | cell prior + AlphaEarth vMF over photo locations / + photo-free train locations / + per-cell grid |
-| Fused | cell prior + AlphaEarth vMF + StreetCLIP vMF |
-| *-serve32 | Milvus-equivalent path: rank by similarity inside the top-32 leaves, then rescore |
+| B0 | argmax leaf centroid |
+| B1 | training-free photo kNN |
+| B2 | cell prior + `lambda · cos(img, photo_j)` over train photos |
+| T2 | cell prior + `kappa · cos(img_emb, tower(location_j))` over photo locations + per-cell grid points |
+| BT2 | union: photos keep the photo term and gain the tower term; grid points get the tower term + an offset |
 
-`kappa`, `lambda` and R are tuned on validation only; the 90% test slice is evaluated once per method. Reported:
-median/mean km, accuracy at 1/25/200/750/2500 km, GeoScore `5000·exp(-d/1492.7)`, country/admin1/city accuracy
-(same reverse geocoder for prediction and ground truth), per-level cell accuracy, calibration (ECE, error by
-confidence decile), AlphaEarth diagnostics (cosine, within-cell MRR vs random), strata (continent, land cover,
-cell density decile, distance to nearest train image), and 1000× bootstrap 95% CIs with **paired** deltas vs B2.
+`kappa`, `lambda`, R and the BT2 offset are tuned on validation only (`tuned.json`).
 
-## Serving
+## Reranker (`rerank.py`)
 
-- Milvus collection `world_locations_v2`: `ae_vec FLOAT_VECTOR(64)` (HNSW, COSINE), `lat`/`lon` DOUBLE,
-  `leaf INT32` (INVERTED), `src INT8` (photo / photo-free / grid), `country_code`.
-- `ingest.py milvus` loads exactly `eval.Env.gallery(...)` for the configuration selected on validation, so
-  serving and evaluation share one gallery definition, and writes the per-leaf counts used by the prior.
-- `predict.py | inference`: leaf-filtered search (`leaf in [...]`), rescoring with the same formula, the same
-  cluster rule, and a cell-centroid fallback. `eval.py parity` checks the live path against eval's serve mode.
+Per photo, 75 candidates: the top 32 B2 hits, the top 32 T2 hits, the top 8 prior cells, and the B0/B2/T2 point
+predictions. Each candidate gets 23 location features: B2 / T2 hit mass within 1-500 km and prior-cell mass within
+25-500 km, log km to the B0/B2/T2 outputs, its own leaf and coarse-level prior log-probabilities, gallery density,
+its raw score and gap to the best of its source, and log km to the nearest other candidate. Plus 7 static features
+(source one-hot, within-source rank) and 7 per-photo features (top-cell confidence, prior entropy, B2/T2 top-1 score
+gaps, B2-T2 disagreement in km, peak B2/T2 hit weight).
+
+- **Scorer**: LightGBM lambdarank over the flattened candidates, labels = GeoScore binned into 31 grades, early
+  stopping on a held-out 10% of validation.
+- **Pick**: minimum Bayes risk, `argmax_j Σ_i softmax(s/T)_i · exp(-d(c_j, c_i)/1492.7)`, i.e. the candidate with the
+  highest expected GeoScore under the scorer's distribution. `T = 0.25`, chosen leave-one-fold-out on validation.
+- The scorer and `T` were selected on validation (5-fold sequence cross-fit inside val) against an MLP with a
+  listwise expected-GeoScore loss: LightGBM + MBR beat it by +24.6 [+16.8, +32.2] GeoScore. That bake-off, the MLP,
+  and the rejected train-holdout variants live on the `experiments` branch.
+
+## Results
+
+Official test folds 1-9 (n = 188,249), one pass, 1000× bootstrap 95% CIs, paired deltas.
+
+| | GeoScore | median km | acc@1 | @25 | @200 | @750 | @2500 km |
+|---|---|---|---|---|---|---|---|
+| Reranker | 4124.7 [4118.8, 4130.4] | 73.9 | 1.3 | 29.6 | 67.7 | 84.7 | 93.5 |
+| B2 | 4055.6 [4049.5, 4061.7] | 77.0 | 0.8 | 28.4 | 65.6 | 83.0 | 92.5 |
+| Oracle (best of 75) | 4604.8 | 15.2 | 11.8 | 57.7 | 84.4 | 94.2 | 97.9 |
+| Pinpoint (reported) | 4114 | — | — | 35.6 | 67.5 | 83.7 | 93.2 |
+
+- Reranker vs B2: +65.6 to +72.3 GeoScore; on the 25,674 photos > 25 km from any train photo, 3205.5 vs 3100.0.
+- 39% of picks come from AlphaEarth candidates (T2 hits and the T2 output).
+- The gain is at regional and continental scale; Pinpoint is clearly better at street/city scale (acc@25 km).
+- The oracle gap (480 GeoScore) says retrieval already surfaces the right place; selection is the bottleneck.
+
+**Disclosures**
+
+- Test subset: folds 1-9 of the official test; fold 0 is validation. Pinpoint reports on the full test set, and our
+  CI is compared against its point estimate.
+- Single seed for every model; CIs cover sampling noise only.
+- The photo gallery is the 2.0M-image subsample (zips 00-39); the full 4.9M train set is not yet used.
+- External data: AlphaEarth satellite embeddings (public, unlabelled with respect to photos). No extra
+  photo-coordinate pairs beyond OSV-5M train; no test photos in any gallery.
 
 ## Infrastructure
 
-- Milvus 2.6.7 standalone + etcd + MinIO via Docker Compose (serving only; training never reads Milvus).
-- Python: PyTorch + transformers + rasterio; Rust: reqwest + tokio + clap.
+Python only: PyTorch, transformers, LightGBM, rasterio. `serve.py` is a stdlib HTTP demo; there is no serving stack.

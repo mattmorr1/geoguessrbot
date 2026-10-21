@@ -3,11 +3,9 @@ import math
 import numpy as np
 import pytest
 import torch
-
 from bins import ancestors, cell_stats, haversine, parent_map, to_latlon, to_xyz
 from eval import distance_metrics, ece, geoscore, leaf_logp, refine, retrieve
 from model import device
-
 
 # ── Bins ──────────────────────────────────────────────────────────────────────
 
@@ -85,13 +83,12 @@ def _toy_gallery():
     return {"leaf": torch.tensor([0, 0, 1, 1], device=device), "vec": {"ae": vec.half().to(device)}}, vec
 
 
-def test_retrieve_prior_gates_gallery_and_serve_mode_agrees():
+def test_retrieve_prior_gates_gallery():
     gal, vec = _toy_gallery()
     qv = {"ae": vec[[2]].half()}  # identical to a point in leaf 1
     prior = (torch.tensor([[0]], dtype=torch.int32), torch.tensor([[0.0]]))  # only leaf 0 allowed
-    for serve_k in (0, 1):
-        hs, hi = retrieve(qv, prior, gal, {"ae": 10.0}, n_leaf=2, k=2, serve_k=serve_k)
-        assert set(hi[0].tolist()) == {0, 1}, f"serve_k={serve_k} leaked a hit outside the allowed leaf"
+    hs, hi = retrieve(qv, prior, gal, {"ae": 10.0}, n_leaf=2, k=2)
+    assert set(hi[0].tolist()) == {0, 1}, "leaked a hit outside the allowed leaf"
     hs, hi = retrieve(qv, None, gal, {"ae": 1.0}, n_leaf=2, k=1)
     assert hi[0, 0].item() == 2
 
@@ -229,7 +226,8 @@ def test_pyramid_index_stacks_depths_and_maps_missing_to_masked_row(tmp_path):
 
 
 def test_fuse_projects_shared_rows_with_train_fit_pca(tmp_path, monkeypatch):
-    import bins, config
+    import bins
+    import config
     rng = np.random.default_rng(0)
     paths = {("train", "streetclip"): "sc", ("train", "siglip2"): "sg", ("train", "fusion2"): "fu"}
     monkeypatch.setattr(config, "FEAT_DIR", str(tmp_path))
@@ -255,7 +253,7 @@ def test_quantize_inverts_dequantize_and_keeps_mask():
 # ── Novel-location split ──────────────────────────────────────────────────────
 
 def test_quadtree_leaves_nest_and_respect_threshold():
-    from bins import qt_center, qt_counts, qt_leaf, QT_DEPTH
+    from bins import QT_DEPTH, qt_center, qt_counts, qt_leaf
     lat = np.r_[np.full(6, 10.0) + np.arange(6) * 1e-3, -40.0]
     lon = np.r_[np.full(6, 20.0) + np.arange(6) * 1e-3, -100.0]
     counts = qt_counts(lat, lon)
@@ -302,7 +300,6 @@ def test_exif_gps_round_trip():
     import io
 
     from PIL import Image
-
     from serve import exif_gps
     img, buf = Image.new("RGB", (8, 8)), io.BytesIO()
     ex = img.getexif()
@@ -321,7 +318,7 @@ def test_gate_switches_on_confidence_or_agreement():
     assert gate(b2, t2, np.ones(3), tau=1.01, delta=0)[0].tolist() == [0.0, 0.0, 0.0]
 
 
-def test_rerank_features_and_scorer_shapes():
+def test_rerank_feature_shapes():
     import rerank as rr
     n, k = 3, rr.K
     pts = torch.as_tensor(to_xyz(np.zeros(n * 4), np.linspace(0, 3, n * 4)), dtype=torch.float32).view(n, 4, 3)
@@ -337,9 +334,14 @@ def test_rerank_features_and_scorer_shapes():
     assert loc.shape == (n, C, 23) and qf.shape == (n, 7)
     assert float(loc[0, 0, 16]) == -2 and float(loc[0, 1, 16]) == -4 and float(loc[..., 22].abs().max()) < 1e-2
     assert torch.allclose(loc[..., 0].float(), torch.ones(1), atol=1e-3) and float(loc[..., 14].abs().max()) < 1e-2
-    x = rr.inputs({"loc": loc, "qf": qf}).flatten(0, 1)
-    s = rr.Scorer(x.shape[1], x.mean(0), x.std(0).clamp(min=1e-6)).to(device)(loc.to(device), qf.to(device))
-    assert s.shape == (n, sum(rr.SRC_N))
+    assert rr.inputs({"loc": loc, "qf": qf}).shape == (n, C, 23 + 7 + 7)
+
+
+def test_mbr_hedges_toward_probable_mass():
+    import rerank as rr
+    cand = torch.as_tensor(to_xyz(np.zeros(3), np.array([0.0, 30.0, 30.1])), dtype=torch.float32)[None]
+    scores = torch.tensor([[1.0, 0.9, 0.9]])
+    assert int(rr.mbr(scores, cand, 1.0)[0]) in (1, 2) and int(rr.mbr(scores, cand, 1e-3)[0]) == 0
 
 
 def test_retrieve_streams_host_gallery_like_device_gallery():
@@ -353,10 +355,9 @@ def test_retrieve_streams_host_gallery_like_device_gallery():
     prior = (top_idx[:, :4], top_lp[:, :4])
     one = {"leaf": leaf.to(device), "vec": {"clip": vec.to(device)}}
     host = {"leaf": leaf.to(device), "vec": {"clip": vec}}
-    for serve_k in (0, 2):
-        ref = retrieve(qv, prior, one, {"clip": 3.0}, L, k=k, serve_k=serve_k, gb=64)   # fp16 ties depend on gb
-        out = retrieve(qv, prior, host, {"clip": 3.0}, L, k=k, serve_k=serve_k, qb=7, gb=64)
-        assert torch.equal(ref[1], out[1]) and torch.equal(ref[0], out[0])
+    ref = retrieve(qv, prior, one, {"clip": 3.0}, L, k=k, gb=64)   # fp16 ties depend on gb
+    out = retrieve(qv, prior, host, {"clip": 3.0}, L, k=k, qb=7, gb=64)
+    assert torch.equal(ref[1], out[1]) and torch.equal(ref[0], out[0])
     logn = torch.log(torch.bincount(leaf, minlength=L).clamp(min=1).float())
     P = torch.full((N, L), -math.inf).scatter_(1, prior[0], prior[1] - logn[prior[0]])
     s = 3.0 * (qv["clip"].float() @ vec.float().T) + P[:, leaf]

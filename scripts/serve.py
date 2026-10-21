@@ -16,18 +16,35 @@ import logging
 import os
 
 import numpy as np
+import torch
 from PIL import Image, ImageOps
 
 import bins
 import config
-from eval import GALLERY_OF, Env, cell_centroid, encode_queries, gate, gate_cfg, method_hits, query_vecs, refine
-from model import load_bridge
-from predict import encode_images, load_encoders
+from eval import FEATS, GALLERY_OF, Env, cell_centroid, encode_queries, gate, gate_cfg, method_hits, query_vecs, refine
+from model import encode_pixels, load_backbone, load_bridge
 
 logger = logging.getLogger(__name__)
 METHODS = ("B2", "T2")
 TOP_CELLS = 64
 PAGE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static", "index.html")
+
+
+def load_encoders(feats):
+    """Frozen backbones for a checkpoint's feature set; fusion768 also loads the train-fit PCA."""
+    pca = np.load(os.path.join(config.FEAT_DIR, f"{feats}_pca.npz")) if feats == "fusion768" else None
+    return [load_backbone(b) for b in (FEATS["fusion"] if pca is not None else FEATS[feats])], pca
+
+
+@torch.no_grad()
+def encode_images(encoders, images):
+    """PIL images -> [N, dim] fp16 features, matching bins.load_feats / bins.fuse on stored shards."""
+    backbones, pca = encoders
+    parts = [encode_pixels(v, p(images=images, return_tensors="pt")["pixel_values"]).float().cpu().numpy() for p, v in backbones]
+    if len(parts) == 1:
+        return parts[0].astype(np.float16)
+    x = np.concatenate([f / np.linalg.norm(f, axis=1, keepdims=True) for f in parts], 1)
+    return (((x.astype(np.float16).astype(np.float32) - pca["mean"]) @ pca["W"]) if pca is not None else x).astype(np.float16)
 
 
 def exif_gps(img):

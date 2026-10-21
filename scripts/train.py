@@ -53,9 +53,9 @@ class EMA:
 
 # ── Data ──────────────────────────────────────────────────────────────────────
 
-def load_data(subset, ae_radius, need_ctx=False, feats="streetclip", rows="all", pyr=None, loc_level=None, holdout=None):
+def load_data(subset, ae_radius, need_ctx=False, feats="streetclip", rows="all", pyr=None, loc_level=None):
     """Train dict over encoded train rows; val = tune slice of the test split (eval.Env). ctx stays on the host."""
-    env = Env(ae_radius, feats, rows, holdout)
+    env = Env(ae_radius, feats, rows)
     meta, rows = env.train, env.rows
     pos = np.arange(len(rows)) if subset == "full" else np.flatnonzero(bins.zip_of("train")[rows] < 4)
     if "holdout" in meta:
@@ -104,8 +104,7 @@ def train(a) -> None:
     os.makedirs(run_dir, exist_ok=True)
 
     pyr = bins.Pyramid() if "pyr" in a.loc else None
-    cells, tr, va = load_data(a.subset, a.ae_radius, "ae" in a.loc.split("+"), a.feats, a.rows, pyr, a.loc_level,
-                              a.holdout)
+    cells, tr, va = load_data(a.subset, a.ae_radius, "ae" in a.loc.split("+"), a.feats, a.rows, pyr, a.loc_level)
     if a.w_ae > 0 and not tr["ae_ok"].any():
         raise SystemExit(f"--w-ae {a.w_ae} but no train AlphaEarth targets at r={a.ae_radius}")
     logger.info("train %d | val %d | AE valid %.1f%% | leaves %d",
@@ -222,7 +221,6 @@ def main() -> None:
     ap.add_argument("--batch-size", type=int, default=config.TRAIN_BATCH_SIZE)
     ap.add_argument("--lr", type=float, default=config.LR)
     ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--holdout", choices=["seq"], help="withhold bins.seq_holdout train rows (reranker training queries)")
     a = ap.parse_args()
     os.makedirs(os.path.join(config.RUNS_DIR, a.name), exist_ok=True)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s",

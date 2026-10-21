@@ -11,13 +11,10 @@ Evaluation: product-of-experts scoring, geodesic metrics, bootstrap CIs, stratif
 Usage:
   python eval.py tune runs/r4/best.pt          # grid for kappa/lambda/R on val (10% test tune slice) -> tuned.json
   python eval.py test runs/r4/best.pt          # single pass on the disjoint 90% of the official test split
-  python eval.py parity runs/r4/best.pt -n 200 # Rust+Milvus serving path vs eval's serve-mode path
   python eval.py tune runs/r4/best.pt --prior-ckpt runs/r1/best.pt   # decoupled -> runs/r4_prior-r1/
   python eval.py tune runs/t_ae/best.pt --methods B2,HT2,UT2 --tag coarse   # subset -> runs/t_ae@coarse/
   python eval.py regions runs/t_ae/best.pt     # localization inside the true cell (no tuning) -> regions_val.json
-  python eval.py crossfit runs/f1/best.pt --methods B2  # full official test: fold k scored with fold k+1's tuning
-  python eval.py report                        # aggregate runs -> results/report.md + best_config.json
-Runs named pilot_* are excluded from best_config selection (different training subset).
+  python eval.py report                        # aggregate runs -> results/report.md
 """
 
 import argparse
@@ -27,8 +24,6 @@ import json
 import logging
 import math
 import os
-import subprocess
-import time
 
 import numpy as np
 import torch
@@ -42,7 +37,6 @@ logger = logging.getLogger(__name__)
 
 THRESH_KM = (1, 5, 10, 25, 200, 750, 2500)
 TOP_M = 256          # leaves kept per query for the soft prior (mass beyond is negligible)
-SERVE_K = 32         # leaves sent to Milvus as a hard filter
 HITS = 64
 GPU_GALLERY_BYTES = 4 << 30   # larger gallery vectors stay in host RAM and stream through retrieve chunk by chunk
 KAPPAS = (2, 5, 10, 20, 40, 80, 160, 320, 640, 1280)
@@ -187,11 +181,10 @@ def _sim(qf, v, lo, hi):
     return s
 
 
-def retrieve(qv, prior, gal, w, n_leaf, k=HITS, serve_k=0, qb=512, gb=1 << 18):
+def retrieve(qv, prior, gal, w, n_leaf, k=HITS, qb=512, gb=1 << 18):
     """
     Top-k hits per query. qv/gal['vec'] share feature keys; w maps key -> weight.
     prior: (top_idx, top_lp), a callable qsl -> dense [qb, n_leaf] additive term (count-normalized), or None.
-    serve_k > 0 mimics Milvus: rank by sim inside the top serve_k leaves, then rescore.
     Gallery chunks are the outer loop, so a host-resident gallery crosses to the GPU once per call.
     """
     leaf, G = gal["leaf"], len(gal["leaf"])
@@ -200,13 +193,12 @@ def retrieve(qv, prior, gal, w, n_leaf, k=HITS, serve_k=0, qb=512, gb=1 << 18):
 
     def leaf_prior(qsl):
         if callable(prior):
-            P = prior(qsl)
-            return torch.where(P >= P.topk(serve_k, 1).values[:, -1:], P, -math.inf) if serve_k else P
+            return prior(qsl)
         if prior is None:
             return None
-        idx = prior[0][qsl, :serve_k or None].to(device).long()
+        idx = prior[0][qsl].to(device).long()
         P = torch.full((len(idx), n_leaf), -math.inf, device=device)
-        return P.scatter_(1, idx, prior[1][qsl, :serve_k or None].to(device) - logn[idx])
+        return P.scatter_(1, idx, prior[1][qsl].to(device) - logn[idx])
 
     hit_s = torch.full((N, k), -math.inf, device=device)
     hit_i = torch.zeros((N, k), dtype=torch.long, device=device)
@@ -217,16 +209,10 @@ def retrieve(qv, prior, gal, w, n_leaf, k=HITS, serve_k=0, qb=512, gb=1 << 18):
             s = sum(wt * _sim(qv[f][qsl].to(device), chunk[f], 0, len(lf)) for f, wt in w.items())
             P = leaf_prior(qsl)
             if P is not None:
-                pr = P.index_select(1, lf)
-                s = torch.where(torch.isfinite(pr), s, -math.inf) if serve_k else s + pr
+                s = s + P.index_select(1, lf)
             cs, ci = s.topk(min(k, s.shape[1]), dim=1)
             hit_s[qsl], sel = torch.cat([hit_s[qsl], cs], 1).topk(k, dim=1)
             hit_i[qsl] = torch.cat([hit_i[qsl], ci + gs], 1).gather(1, sel)
-    if serve_k and prior is not None:
-        for qs in range(0, N, qb):
-            qsl = slice(qs, qs + qb)
-            bs = hit_s[qsl]
-            hit_s[qsl] = torch.where(torch.isfinite(bs), bs + leaf_prior(qsl).gather(1, leaf[hit_i[qsl]]), bs)
     return hit_s.cpu(), hit_i.cpu()
 
 
@@ -246,20 +232,15 @@ def refine(hit_s, hit_i, gal_xyz, radius_km, fallback):
 
 class Env:
     """Lazily loaded meta, features, and galleries; queries come only from the test split.
-    feats picks the backbone(s); rows='common' restricts train/gallery/queries to rows every backbone encoded (bake-off).
-    holdout='seq' withholds a sequence-hash slice of official train from training and galleries (split 'trainho')."""
+    feats picks the backbone(s); rows='common' restricts train/gallery/queries to rows every backbone encoded (bake-off)."""
 
-    def __init__(self, ae_radius, feats="streetclip", rows="all", holdout=None):
+    def __init__(self, ae_radius, feats="streetclip", rows="all"):
         self.r, self.bbs = ae_radius, FEATS[feats]
         self.common = FEATS["fusion"] if rows == "common" else self.bbs
         self.cells = bins.load("cells")
         self.anc = self.cells["anc"]
         self.n_leaf = len(self.anc)
         self.train = bins.load("train")
-        if holdout == "seq":
-            if "holdout" in self.train:
-                raise SystemExit(f"SPLIT={config.SPLIT} already has a train holdout")
-            self.train["holdout"] = bins.seq_holdout()
         self.rows = self._rows("train")
         self.clip = bins.load_feats("train", self.rows, self.bbs)
         self.ae_train = self._ae("train")
@@ -305,13 +286,7 @@ class Env:
         return torch.cat(out).numpy() if out else np.zeros((0, tower.out_dim), np.float16)
 
     def queries(self, split):
-        """val = test tune slice, test = the disjoint rest (split by sequence in bins.build); foldK = K-th hash fold;
-        trainho = encoded rows of the train holdout."""
-        if split == "trainho":
-            tr, pos = self.train, np.flatnonzero(self.train["holdout"][self.rows])
-            r = self.rows[pos]
-            return {"X": self.clip[pos], "lat": tr["lat"][r], "lon": tr["lon"][r], "cells": tr["cells"][r],
-                    "country": tr["country"][r], "land_cover": tr["aux_cat"][r, 2], "ae_true": None}
+        """val = test tune slice, test = the disjoint rest (split by sequence in bins.build); foldK = K-th hash fold."""
         meta, rows = bins.load("test"), self._rows("test")
         if split.startswith("fold"):
             rows = rows[bins.test_folds()[rows] == int(split[4:])]
@@ -379,26 +354,24 @@ class Env:
 GALLERY_OF = {"B1": "photos", "B2": "photos", "G0": "G0", "G1": "G1", "G2": "G2", "Fused": "fused", "T0": "T0", "T2": "T2",
               "HT2": "T2", "UT2": "T2", "HG2": "G2", "BT2": "BT2"}
 DIAG = {"G0": "ae", "G2": "ae", "T0": "loc", "T2": "loc"}   # within-cell MRR; *2 adds land-grid candidates (blocks)
-SERVABLE = {"B2", "G0", "G1", "G2", "Fused"}   # Milvus holds ae_vec / clip_vec only; tower methods are eval-only
 
 
-def method_hits(name, q, gal, qv, p, env, serve_k=0):
+def method_hits(name, q, gal, qv, p, env):
     prior = (q["top_idx"], q["top_lp"])
     if name == "B1":
         return retrieve(qv, None, gal, {"clip": 1.0}, env.n_leaf)
     if name == "B2":
-        return retrieve(qv, prior, gal, {"clip": p["lambda"]}, env.n_leaf, serve_k=serve_k)
+        return retrieve(qv, prior, gal, {"clip": p["lambda"]}, env.n_leaf)
     if name == "Fused":
-        return retrieve(qv, prior, gal, {"ae": p["kappa"], "clip": p["lambda"]}, env.n_leaf, serve_k=serve_k)
+        return retrieve(qv, prior, gal, {"ae": p["kappa"], "clip": p["lambda"]}, env.n_leaf)
     if name == "BT2":
-        return retrieve(qv, prior, gal, {"clip": p["lambda"], "loc": p["kappa"], "flag": p["offset"]}, env.n_leaf,
-                        serve_k=serve_k)
+        return retrieve(qv, prior, gal, {"clip": p["lambda"], "loc": p["kappa"], "flag": p["offset"]}, env.n_leaf)
     if name[0] in "HU":
         w = {"ae" if name[1] == "G" else "loc": p["kappa"]}
         if name[0] == "U":
             return retrieve(qv, None, gal, w, env.n_leaf)
-        return retrieve(qv, mixed_prior(q, p, env, gal), gal, w, env.n_leaf, serve_k=serve_k)
-    return retrieve(qv, prior, gal, {"ae" if name[0] == "G" else "loc": p["kappa"]}, env.n_leaf, serve_k=serve_k)
+        return retrieve(qv, mixed_prior(q, p, env, gal), gal, w, env.n_leaf)
+    return retrieve(qv, prior, gal, {"ae" if name[0] == "G" else "loc": p["kappa"]}, env.n_leaf)
 
 
 def query_vecs(q, X):
@@ -618,35 +591,6 @@ def gate_eval(model, ck, env, run_dir):
     return out
 
 
-def crossfit(model, ck, env, run_dir, only=None):
-    """Full official test without test-tuned settings: fold k is predicted with the grid tuned on fold k+1.
-    Fold 0 is also the early-stopping slice, so its metrics are reported apart as a check."""
-    if config.SPLIT != "official":
-        raise SystemExit("crossfit covers the official test split")
-    meta, rows = bins.load("test"), env._rows("test")
-    fold = bins.test_folds()[rows]
-    preds = {}
-    for k in range(bins.TUNE_MOD):
-        sub = os.path.join(run_dir, "crossfit", f"fold{k}")
-        os.makedirs(sub, exist_ok=True)
-        tuned = tune(model, ck, env, sub, only, val=f"fold{(k + 1) % bins.TUNE_MOD}")
-        for m, (lat, lon) in predict(model, env, env.queries(f"fold{k}"), tuned).items():
-            ll = preds.setdefault(m, np.full((2, len(rows)), np.nan))
-            ll[0, fold == k], ll[1, fold == k] = lat, lon
-    dists = {m: bins.haversine(meta["lat"][rows], meta["lon"][rows], *ll) for m, ll in preds.items()}
-    gt = admin_labels(meta["lat"][rows], meta["lon"][rows])[0]
-    base = dists.get("B2")
-    res = {"n_test": len(rows), "methods": {m: {**distance_metrics(d), **with_cis(d, None if m == "B2" else base),
-                                                "acc_country": float((admin_labels(*preds[m])[0] == gt).mean()),
-                                                "geoscore_fold0": float(geoscore(d[fold == 0]).mean()),
-                                                "geoscore_folds1_9": float(geoscore(d[fold != 0]).mean())}
-                                           for m, d in dists.items()}}
-    json.dump(res, open(os.path.join(run_dir, "crossfit_metrics.json"), "w"), indent=2)
-    np.savez_compressed(os.path.join(run_dir, "crossfit_dists.npz"), **{m: d.astype(np.float32) for m, d in dists.items()})
-    logger.info("crossfit %s: %s", os.path.basename(run_dir), {m: (round(r["geoscore"], 1), round(r["median_km"], 1),
-                round(100 * r["acc_country"], 1)) for m, r in res["methods"].items()})
-    return res
-
 
 def test(model, ck, env, run_dir):
     tuned = json.load(open(os.path.join(run_dir, "tuned.json")))
@@ -661,9 +605,6 @@ def test(model, ck, env, run_dir):
             continue
         gal = env.gallery(GALLERY_OF[m], model.tower)
         preds[m] = refine(*method_hits(m, q, gal, qv, p, env), gal["xyz"], p["radius_km"], fb)
-        if m != "B1" and m[0] != "U":
-            preds[f"{m}-serve{SERVE_K}"] = refine(*method_hits(m, q, gal, qv, p, env, serve_k=SERVE_K),
-                                                  gal["xyz"], p["radius_km"], fb)
         if m in DIAG:
             diag[m] = ae_diag(q, Q, env, gal, DIAG[m])
         del gal
@@ -722,29 +663,6 @@ def fmt_ci(ci, scale=1):
     return f"[{scale * ci[0]:+.1f}, {scale * ci[1]:+.1f}]" if ci else "—"
 
 
-# ── Parity with the Rust + Milvus serving path ────────────────────────────────
-
-def parity(model, ck, env, run_dir, n):
-    import predict
-    cfg = json.load(open(os.path.join(config.RESULTS_DIR, "best_config.json")))
-    Q = env.queries("test")
-    X = np.asarray(Q["X"][:n])
-    q = encode_queries(model, X, env.anc, alpha=cfg["alpha"])
-    gal = env.gallery(GALLERY_OF[cfg["method"]])
-    lat_e, lon_e = refine(*method_hits(cfg["method"], q, gal, {"ae": q["ae"], "clip": normalize16(X)}, cfg, env,
-                                       serve_k=SERVE_K), gal["xyz"], cfg["radius_km"], cell_centroid(env, q["b0"].numpy()))
-    exe = os.path.join(config.ROOT, "scripts", "inference", "target", "release", "inference")
-    d, t0 = [], time.time()
-    for i, pl in enumerate(predict.make_payloads(model, X, cfg)):
-        out = json.loads(subprocess.run([exe], input=json.dumps(pl), capture_output=True, text=True, check=True).stdout)
-        d.append(bins.haversine(out["lat"], out["lon"], lat_e[i], lon_e[i]))
-    d = np.array(d)
-    res = {"n": n, "within_1km": float((d <= 1).mean()), "median_km": float(np.median(d)),
-           "p95_km": float(np.percentile(d, 95)), "sec_per_query": (time.time() - t0) / n}
-    json.dump(res, open(os.path.join(run_dir, "parity.json"), "w"), indent=2)
-    logger.info("parity: %s", res)
-    return res
-
 
 # ── Report across runs ────────────────────────────────────────────────────────
 
@@ -789,7 +707,7 @@ def claims_md(rows):
 
 def report():
     runs = sorted(glob.glob(os.path.join(config.RUNS_DIR, "*", "tuned.json")))
-    rows, best = [], None
+    rows = []
     for t in runs:
         run = os.path.basename(os.path.dirname(t))
         tuned = json.load(open(t))
@@ -797,30 +715,20 @@ def report():
             continue
         for m, p in tuned.items():
             rows.append((run, m, p["val_geoscore"]))
-            if (m in SERVABLE and not run.startswith("pilot")
-                    and (best is None or p["val_geoscore"] > best["val_geoscore"])):
-                best = {"run": run, "method": m, "alpha": tuned["B0"]["alpha"], **p}
     os.makedirs(config.RESULTS_DIR, exist_ok=True)
     md = ["# Validation GeoScore (selection only; test numbers in each run's summary.md)", "",
           "| run | method | val GeoScore |", "|---|---|---|"] + [f"| {r} | {m} | {g:.1f} |" for r, m, g in rows]
     md += claims_md(rows)
     md += ["", *[open(s).read() for s in sorted(glob.glob(os.path.join(config.RUNS_DIR, "*", "summary.md")))]]
     open(os.path.join(config.RESULTS_DIR, "report.md"), "w").write("\n".join(md))
-    if best:
-        ae_run, _, prior_run = best["run"].split("@")[0].partition("_prior-")
-        best |= {"ckpt": os.path.join(config.RUNS_DIR, ae_run, "best.pt"), "k_cells": SERVE_K, "limit": HITS,
-                 "prior_ckpt": os.path.join(config.RUNS_DIR, prior_run, "best.pt") if prior_run else None,
-                 "field": "clip_vec" if best["method"] == "B2" else "ae_vec", "gallery": GALLERY_OF[best["method"]]}
-        json.dump(best, open(os.path.join(config.RESULTS_DIR, "best_config.json"), "w"), indent=2)
-    logger.info("report: %d rows, best=%s", len(rows), best)
+    logger.info("report: %d rows", len(rows))
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("cmd", choices=["tune", "test", "parity", "report", "regions", "crossfit", "gate"])
+    ap.add_argument("cmd", choices=["tune", "test", "report", "regions", "gate"])
     ap.add_argument("--split", choices=["val", "test"], default="val", help="regions only")
     ap.add_argument("ckpt", nargs="?")
-    ap.add_argument("-n", type=int, default=200)
     ap.add_argument("--prior-ckpt", help="cell logits from this model, AE from ckpt (decoupled scoring)")
     ap.add_argument("--methods", help="comma list: tune only these (B0 always); pair with --tag to keep the full run intact")
     ap.add_argument("--objective", choices=list(OBJECTIVES), default="geoscore", help="tune selection metric")
@@ -833,7 +741,7 @@ def main():
         ap.error(f"{a.cmd} needs a checkpoint path")
     model, ck = load_bridge(a.ckpt)
     data = lambda c: (c["args"].get("feats", "streetclip"), c["args"].get("rows", "all"))
-    env = Env(ck["args"]["ae_radius"], *data(ck), holdout=ck["args"].get("holdout"))
+    env = Env(ck["args"]["ae_radius"], *data(ck))
     run_dir = os.path.dirname(os.path.abspath(a.ckpt))
     if a.prior_ckpt:
         prior, pck = load_bridge(a.prior_ckpt)
@@ -846,9 +754,7 @@ def main():
         run_dir += "@" + a.tag
     os.makedirs(run_dir, exist_ok=True)
     only = set(a.methods.split(",")) if a.methods else None
-    {"tune": lambda *x: tune(*x, only, objective=a.objective), "test": test, "regions": lambda *x: regions(*x, a.split),
-     "crossfit": lambda *x: crossfit(*x, only), "gate": gate_eval,
-     "parity": lambda *x: parity(*x, a.n)}[a.cmd](model, ck, env, run_dir)
+    {"tune": lambda *x: tune(*x, only, objective=a.objective), "test": test, "regions": lambda *x: regions(*x, a.split), "gate": gate_eval}[a.cmd](model, ck, env, run_dir)
 
 
 if __name__ == "__main__":
