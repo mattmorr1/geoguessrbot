@@ -16,7 +16,7 @@ TEMP_DIR          = os.path.join(DATA_DIR, "tmp")
 SPLIT             = os.getenv("SPLIT", "official")
 _NS               = "" if SPLIT == "official" else f"_{SPLIT}"
 META_DIR          = os.path.join(DATA_DIR, "meta" + _NS)
-FEAT_DIR          = os.path.join(DATA_DIR, "feats")
+FEAT_DIR          = os.getenv("FEAT_DIR",    os.path.join(DATA_DIR, "feats"))   # data/feats/backup_2m = headline gallery
 RUNS_DIR          = os.getenv("RUNS_DIR",    os.path.join(ROOT, "runs" + _NS))
 RESULTS_DIR       = os.getenv("RESULTS_DIR", os.path.join(ROOT, "results" + _NS))
 LOG_DIR           = os.path.join(ROOT, "logs")
@@ -30,6 +30,7 @@ QT_LEVELS = (50000, 25000, 12500, 5000, 2500, 1000, 500)  # coarse -> fine, stri
 TEST_LEVEL = 1000                                          # only level labelled in test.csv
 AE_YEARS  = (2017, 2024)                                   # AlphaEarth annual coverage
 GRID_YEAR = 2020
+GRID_FILL = os.getenv("GRID_FILL", "0") == "1"   # T2 gallery also gets the sparse-area fill (bins.py fill)
 
 # ── Ingest ───────────────────────────────────────────────────────────────────
 

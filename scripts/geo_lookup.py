@@ -294,7 +294,7 @@ def contexts(sets):
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--sets", nargs="+", default=["train", "test", "grid"], choices=["train", "test", "grid"])
+    ap.add_argument("--sets", nargs="+", default=["train", "test", "grid"], choices=["train", "test", "grid", "grid_fill"])
     ap.add_argument("--limit-tiles", type=int, default=0, help="read only N tiles (smoke test)")
     ap.add_argument("--cache", action="store_true", help="cache 320 m rasters + 2.56 km land grid instead")
     ap.add_argument("--contexts", action="store_true", help="build location-tower contexts from the cache")

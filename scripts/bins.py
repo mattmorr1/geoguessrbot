@@ -319,6 +319,27 @@ def grid(per=256, max_nn_km=50.0, seed=0):
     logger.info("grid: %d cells x %d -> %d points within %.0f km of a train row", n, per, keep.sum(), max_nn_km)
 
 
+def fill(min_km=10.0, spacing_km=10.0):
+    """Sparse-area grid fill from the cached land grid: one point per spacing_km block beyond min_km of any train row.
+    Only tiles touched by train or grid points: the cache also holds test-only tiles, which would leak test locations."""
+    from scipy.spatial import cKDTree
+    from geo_lookup import aef_index, assign, dequantize
+    tr, gr, ix = load("train"), load("grid"), aef_index(config.AE_YEAR)
+    ok = set(np.unique(np.r_[assign(tr["lat"], tr["lon"], ix)[0], assign(gr["lat"], gr["lon"], ix)[0]]).tolist())
+    parts = [(z["lat"], z["lon"], z["q"]) for p in _cache_paths() if int(os.path.basename(p)[:6]) in ok
+             for z in [np.load(p)]]
+    lat, lon, q = (np.concatenate(v) for v in zip(*parts))
+    chord, nn = cKDTree(to_xyz(tr["lat"], tr["lon"])).query(to_xyz(lat, lon), workers=-1)
+    far = np.flatnonzero(2 * R_EARTH_KM * np.arcsin(np.clip(chord / 2, 0, 1)) > min_km)
+    sel = far[np.unique(block_ids(lat[far], lon[far], km=spacing_km), return_index=True)[1]]
+    np.savez(os.path.join(config.META_DIR, "grid_fill.npz"), lat=lat[sel], lon=lon[sel], leaf=tr["cells"][nn[sel], LEAF],
+             year=np.full(len(sel), config.GRID_YEAR, np.int16))
+    os.makedirs(os.path.dirname(ae_path("grid_fill", 80)), exist_ok=True)
+    np.save(ae_path("grid_fill", 80), dequantize(q[sel]).astype(np.float16))  # land-grid q is the 80 m vector
+    logger.info("fill: %d land points in %d train/grid tiles -> %d beyond %.0f km at %.0f km spacing",
+                len(lat), len(ok), len(sel), min_km, spacing_km)
+
+
 # ── Novel-location split (SPLIT=blocks) ───────────────────────────────────────
 
 BLOCK_KM, HOLD_FRAC, TUNE_FRAC, QT_DEPTH, GRID_REACH_KM = 100.0, 0.10, 0.10, 10, 120.0
@@ -577,7 +598,7 @@ def blocks(seed=0):
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("cmd", choices=["build", "align", "grid", "blocks", "pyramid", "fuse"])
+    ap.add_argument("cmd", choices=["build", "align", "grid", "fill", "blocks", "pyramid", "fuse"])
     ap.add_argument("--split", choices=["train", "test", "both"], default="both")
     ap.add_argument("--per", type=int, default=256)
     ap.add_argument("--backbone", choices=["streetclip", "siglip2"], default="streetclip")
@@ -591,6 +612,8 @@ if __name__ == "__main__":
         fuse(["train", "test"] if a.split == "both" else [a.split])
     elif a.cmd == "pyramid":
         pyramid()
+    elif a.cmd == "fill":
+        fill()
     elif a.cmd == "blocks":
         if config.SPLIT == "official":
             raise SystemExit("run with SPLIT=blocks so outputs land in the blocks namespace")

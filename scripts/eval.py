@@ -326,13 +326,13 @@ class Env:
             sel, src = np.concatenate([g0, extra]), np.r_[src, np.ones(len(extra), np.int8)]
         lat, lon, leaf = tr["lat"][sel], tr["lon"][sel], tr["cells"][sel, bins.LEAF]
         vec = (np.asarray(self.ae_train[sel]) if kind == "G" else self.embed(tower, "train", sel, lat, lon))
-        if lvl == "2":
-            g, gae = bins.load("grid"), self._ae("grid")
+        for gname in (("grid", "grid_fill") if config.GRID_FILL else ("grid",)) if lvl == "2" else ():
+            g, gae = bins.load(gname), self._ae(gname)
             if gae is None:
-                raise FileNotFoundError("grid AE not sampled")
+                raise FileNotFoundError(f"{gname} AE not sampled")
             gsel = np.flatnonzero(~np.isnan(np.asarray(gae[:, 0], np.float32)))
             glat, glon = g["lat"][gsel], g["lon"][gsel]
-            gvec = np.asarray(gae)[gsel] if kind == "G" else self.embed(tower, "grid", gsel, glat, glon)
+            gvec = np.asarray(gae)[gsel] if kind == "G" else self.embed(tower, gname, gsel, glat, glon)
             lat, lon, leaf, vec = np.r_[lat, glat], np.r_[lon, glon], np.r_[leaf, g["leaf"][gsel]], np.concatenate([vec, gvec])
             src = np.r_[src, np.full(len(gsel), 2, np.int8)]
         vecs = {"ae" if kind == "G" else "loc": (vec, None)}

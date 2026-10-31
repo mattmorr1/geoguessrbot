@@ -87,19 +87,19 @@ def candidate_feats(cand, hits, cells, preds, p1000, own, leafc, pq, bs=2048):
     return torch.cat(loc), torch.cat(qf)
 
 
-def extract(pm, tm, env, cfg, split, tag):
-    """Candidates, features and per-candidate km to the truth for one query split (cached under data/rerank).
-    pm supplies the prior, B0 and B2; tm the T2 tower (and its own prior inside T2 retrieval)."""
-    path = os.path.join(config.DATA_DIR, "rerank", f"{config.SPLIT}_{split}_{tag}.pt")
-    if os.path.exists(path):
-        return torch.load(path)
-    Q = env.queries(split)
-    qp = encode_queries(pm, Q["X"], env.anc, alpha=cfg["B0"]["alpha"])
-    qt = qp if tm is pm else encode_queries(tm, Q["X"], env.anc, alpha=cfg["T2"]["alpha"])
+def xyz(ll):
+    return torch.as_tensor(bins.to_xyz(*ll), dtype=torch.float32)
+
+
+def candidates(pm, tm, env, cfg, X, gallery):
+    """Candidates and features for query features X; gallery(m) -> the B2 / T2 gallery. pm supplies the prior, B0 and
+    B2; tm the T2 tower. Returns ({cand, loc, qf}, {B0, B2, T2: (lat, lon)}, the prior model's query outputs)."""
+    qp = encode_queries(pm, X, env.anc, alpha=cfg["B0"]["alpha"])
+    qt = qp if tm is pm else encode_queries(tm, X, env.anc, alpha=cfg["T2"]["alpha"])
     fb = cell_centroid(env, qp["b0"].numpy())
     hits, preds, raw, leaves = {}, {"B0": fb}, {}, {}
     for m, q in (("B2", qp), ("T2", qt)):
-        gal, qv = env.gallery(GALLERY_OF[m], tm.tower), query_vecs(q, Q["X"])
+        gal, qv = gallery(m), query_vecs(q, X)
         hs, hi = method_hits(m, q, gal, qv, cfg[m], env)
         preds[m] = refine(hs, hi, gal["xyz"], cfg[m]["radius_km"], fb)
         hi = hi[:, :K]
@@ -110,7 +110,6 @@ def extract(pm, tm, env, cfg, split, tag):
         hits[m] = (hs[:, :K], gal["xyz"][hi])
         del gal
         torch.cuda.empty_cache()
-    xyz = lambda ll: torch.as_tensor(bins.to_xyz(*ll), dtype=torch.float32)
     top = qp["top_idx"].long()
     cells = (xyz(cell_centroid(env, top[:, :PRIOR_TOP].numpy())), qp["top_lp"][:, :PRIOR_TOP].float())
     px = {m: xyz(v) for m, v in preds.items()}
@@ -121,11 +120,21 @@ def extract(pm, tm, env, cfg, split, tag):
     pq = {"top_idx": top, "top_lp": qp["top_lp"], "anc": env.anc, "logn": logn,
           **{f"lp{l}": qp[f"lp{l}"] for l in COARSE_LEVELS}}
     loc, qf = candidate_feats(cand, hits, cells, px, qp["p1000"].float(), own, leafc, pq)
-    out = {"cand": cand, "loc": loc, "qf": qf, "dist": km(cand, xyz((Q["lat"], Q["lon"]))[:, None])[..., 0],
-           "nn_km": torch.as_tensor(env.nn_km(Q["lat"], Q["lon"]), dtype=torch.float32)}
+    return {"cand": cand, "loc": loc, "qf": qf}, preds, qp
+
+
+def extract(pm, tm, env, cfg, split, tag):
+    """candidates() for one query split plus per-candidate km to the truth, cached under data/rerank."""
+    path = os.path.join(config.DATA_DIR, "rerank", f"{config.SPLIT}_{split}_{tag}.pt")
+    if os.path.exists(path):
+        return torch.load(path)
+    Q = env.queries(split)
+    out = candidates(pm, tm, env, cfg, Q["X"], lambda m: env.gallery(GALLERY_OF[m], tm.tower))[0]
+    out |= {"dist": km(out["cand"], xyz((Q["lat"], Q["lon"]))[:, None])[..., 0],
+            "nn_km": torch.as_tensor(env.nn_km(Q["lat"], Q["lon"]), dtype=torch.float32)}
     os.makedirs(os.path.dirname(path), exist_ok=True)
     torch.save(out, path)
-    logger.info("extract %s: %d queries x %d candidates, %d loc + %d query feats", split, *loc.shape, qf.shape[1])
+    logger.info("extract %s: %d queries x %d candidates, %d loc + %d query feats", split, *out["loc"].shape, out["qf"].shape[1])
     return out
 
 
@@ -181,22 +190,27 @@ def mbr(scores, cand, t):
                       for s in range(0, len(cand), 4096)])
 
 
+def setup(ckpt, prior=None):
+    """(prior model, tower model, Env, cfg, tower ckpt args): B0 / B2 tuned on the prior run, T2 kept sharp as in gate_cfg."""
+    tm, ck = load_bridge(ckpt)
+    pm = load_bridge(prior)[0] if prior else tm
+    env = Env(ck["args"]["ae_radius"], ck["args"].get("feats", "streetclip"), ck["args"].get("rows", "all"))
+    with open(os.path.join(os.path.dirname(os.path.abspath(prior or ckpt)), "tuned.json")) as f:
+        tuned = json.load(f)
+    g = gate_cfg(os.path.dirname(os.path.abspath(ckpt)))
+    return pm, tm, env, {"B0": tuned["B0"], "B2": tuned["B2"], "T2": {**g["T2"], "alpha": g["B0"]["alpha"]}}, ck["args"]
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("ckpt", help="run with the location tower (T2)")
     ap.add_argument("--prior", help="run supplying the prior, B0 and B2 (default: ckpt)")
     a = ap.parse_args()
-    tm, ck = load_bridge(a.ckpt)
-    pm = load_bridge(a.prior)[0] if a.prior else tm
+    pm, tm, env, cfg, _ = setup(a.ckpt, a.prior)
     run_dir = os.path.dirname(os.path.abspath(a.ckpt))
     prior_dir = os.path.dirname(os.path.abspath(a.prior or a.ckpt))
-    env = Env(ck["args"]["ae_radius"], ck["args"].get("feats", "streetclip"), ck["args"].get("rows", "all"))
-    with open(os.path.join(prior_dir, "tuned.json")) as f:
-        tuned = json.load(f)
-    g = gate_cfg(run_dir)
-    cfg = {"B0": tuned["B0"], "B2": tuned["B2"], "T2": {**g["T2"], "alpha": g["B0"]["alpha"]}}
-    tag = f"v2_{os.path.basename(prior_dir)}"
-    out = run_dir + "@rerank2_lgb"
+    tag = f"v2_{os.path.basename(prior_dir)}" + ("_fill" if config.GRID_FILL else "")
+    out = run_dir + "@rerank2_lgb" + ("_fill" if config.GRID_FILL else "")
     os.makedirs(out, exist_ok=True)
     tr, te = (extract(pm, tm, env, cfg, s, tag) for s in ("val", "test"))
     model = lgb_fit(tr)

@@ -1,79 +1,106 @@
 <!doctype html>
-<html lang="en">
+<!-- data-api: base URL of serve.py when this page is hosted elsewhere (e.g. the Cloud Run URL); empty = same origin -->
+<html lang="en" data-api="">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Geolocate Demo</title>
+<meta name="color-scheme" content="only light">
+<title>where was this?</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
 <style>
-  :root { --bg: #f6f6f4; --fg: #1d1d1b; --muted: #6b6b66; --line: #d9d9d4; --panel: #fff; }
-  @media (prefers-color-scheme: dark) { :root { --bg: #161615; --fg: #ececea; --muted: #9a9a94; --line: #33332f; --panel: #1f1f1d; } }
+  :root { --ink: #000; --paper: #fff; --muted: #666; --mono: "IBM Plex Mono", ui-monospace, Menlo, monospace; }
+  html { background: var(--paper); color-scheme: only light; }
   * { box-sizing: border-box; }
-  body { margin: 0; font: 14px/1.4 system-ui, sans-serif; background: var(--bg); color: var(--fg); display: grid;
-         grid-template-columns: 320px 1fr; height: 100vh; }
-  aside { padding: 16px; border-right: 1px solid var(--line); background: var(--panel); overflow-y: auto; }
-  #drop { border: 2px dashed var(--line); border-radius: 8px; padding: 20px; text-align: center; color: var(--muted); cursor: pointer; }
-  #drop.over { border-color: var(--fg); }
-  #preview { width: 100%; margin-top: 12px; border-radius: 6px; display: none; }
-  table { width: 100%; border-collapse: collapse; margin-top: 12px; }
-  td { padding: 4px 0; border-bottom: 1px solid var(--line); }
-  td:last-child { text-align: right; font-variant-numeric: tabular-nums; }
-  .dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 6px; }
-  #status, .note { color: var(--muted); margin-top: 10px; }
-  #map { height: 100vh; }
-  @media (max-width: 700px) { body { grid-template-columns: 1fr; grid-template-rows: auto 60vh; height: auto; }
-                              #map { height: 60vh; } aside { border-right: 0; } }
+  body { margin: 0; min-height: 100dvh; color: var(--ink); font: 400 0.85rem/1.5 var(--mono);
+         background: var(--paper) radial-gradient(circle, var(--ink) 0.6px, transparent 0.8px) 0 0 / 22px 22px;
+         display: grid; grid-template-columns: 360px 1fr; gap: 28px; padding: 24px 32px 32px 24px; height: 100dvh; }
+  .card { background: var(--paper); border: 1.5px solid var(--ink); box-shadow: 8px 8px 0 var(--ink); }
+  aside { padding: 24px; overflow-y: auto; display: flex; flex-direction: column; gap: 14px; }
+  h1 { margin: 0; font: 700 1.6rem Georgia, "Times New Roman", serif; }
+  #drop { border: 1.5px dashed var(--ink); padding: 22px 16px; text-align: center; cursor: pointer; transition: transform .08s, box-shadow .08s; }
+  #drop:hover, #drop.over { box-shadow: 4px 4px 0 var(--ink); transform: translate(-2px, -2px); border-style: solid; }
+  #drop:focus-visible { outline: 2px solid var(--ink); outline-offset: 3px; }
+  #preview { width: 100%; border: 1.5px solid var(--ink); display: none; }
+  #status { min-height: 1.5em; color: var(--muted); }
+  #status.err { color: var(--ink); font-weight: 600; }
+  #result { font: 700 1.3rem Georgia, "Times New Roman", serif; font-variant-numeric: tabular-nums; }
+  .sub { margin: -6px 0 0; color: var(--muted); }
+  .links { margin-top: auto; display: flex; justify-content: space-between; }
+  .back { color: var(--ink); font-size: 0.75rem; }
+  .back:hover { opacity: 0.6; }
+  #map { height: 100%; min-height: 0; }
+  .tag { display: inline-block; font: 600 0.7rem/1 var(--mono); padding: 4px 6px; border: 1.5px solid var(--ink);
+         background: var(--paper); color: var(--ink); box-shadow: 2px 2px 0 var(--ink); white-space: nowrap; }
+  .tag.final { background: var(--ink); color: var(--paper); }
+  .tag.truth { background: var(--paper); border-style: dashed; }
+  .leaflet-container { font: 400 0.75rem var(--mono); background: #f4f4f2; }
+  .leaflet-bar, .leaflet-bar a { border-radius: 0 !important; }
+  .leaflet-bar { border: 1.5px solid var(--ink) !important; box-shadow: 3px 3px 0 var(--ink) !important; }
+  .leaflet-bar a { color: var(--ink); border-bottom: 1.5px solid var(--ink); }
+  .leaflet-tooltip { border-radius: 0; border: 1.5px solid var(--ink); box-shadow: 3px 3px 0 var(--ink); font-family: var(--mono); }
+  .leaflet-tooltip::before { display: none; }
+  .pin { background: none; border: 0; }
+  @media (max-width: 760px) {
+    body { grid-template-columns: 1fr; grid-template-rows: auto 65vh; height: auto; padding: 16px 24px 28px 16px; gap: 24px; }
+  }
 </style>
 </head>
 <body>
-<aside>
-  <div id="drop">Drop, paste or click to choose a photo<input id="file" type="file" accept="image/*" hidden></div>
+<aside class="card">
+  <h1>where am i?</h1>
+  <p class="sub">drop a street-level photo and the model will guess where on earth it was taken.</p>
+  <div id="drop" role="button" tabindex="0">drop a photo<input id="file" type="file" accept="image/*" hidden></div>
   <img id="preview" alt="uploaded photo">
-  <div id="status"></div>
-  <table id="out"></table>
-  <p class="note">Circles: top cells of the classifier prior (area ~ probability). Photos with EXIF GPS show the truth in black.</p>
+  <div id="status" aria-live="polite"></div>
+  <div id="result"></div>
+  <div class="links"><a class="back" href="https://mattmorr.com/">&larr; mattmorr.com</a><a class="back" href="how.html">how does it work?</a></div>
 </aside>
-<div id="map"></div>
+<div id="map" class="card"></div>
 <script>
-const COLORS = { FINAL: "#1a9e5c", B0: "#8a8a84", B2: "#2f6fdf", T2: "#d9534f" };
-const NAMES = { FINAL: "Final (gated)", B0: "B0 cell prior", B2: "B2 photo kNN", T2: "T2 AlphaEarth map" };
+const API = document.documentElement.dataset.api;
 const map = L.map("map", { worldCopyJump: true }).setView([20, 0], 2);
-L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", { maxZoom: 18, attribution: "&copy; OpenStreetMap" }).addTo(map);
-let layer = L.layerGroup().addTo(map);
+L.tileLayer("https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png",
+  { maxZoom: 18, subdomains: "abcd", attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> &copy; <a href="https://carto.com/attributions">CARTO</a>' }).addTo(map);
+const layer = L.layerGroup().addTo(map);
 const $ = id => document.getElementById(id);
+const pin = (ll, text, cls) => L.marker(ll, { icon: L.divIcon({ className: "pin", html: `<span class="tag ${cls}">${text}</span>`, iconSize: null, iconAnchor: [0, 0] }) });
+const status = (msg, err = false) => { $("status").textContent = msg; $("status").classList.toggle("err", err); };
+
+async function wake() {
+  if (!API) return;
+  status("waking up...");
+  try { const r = await fetch(`${API}/health`); status(r.ok ? "" : "offline", !r.ok); }
+  catch { status("offline", true); }
+}
 
 async function run(file) {
   $("preview").src = URL.createObjectURL(file); $("preview").style.display = "block";
-  $("status").textContent = "Locating..."; $("out").innerHTML = ""; layer.clearLayers();
-  const r = await fetch("/predict", { method: "POST", body: file });
-  const res = await r.json();
-  if (!r.ok) { $("status").textContent = res.error; return; }
-  $("status").textContent = res.truth ? `Truth from EXIF; nearest training row ${res.nn_train_km.toFixed(1)} km away` : "No EXIF GPS: no ground truth";
-  const pts = [];
-  for (const [lat, lon, p] of res.cells)
-    L.circleMarker([lat, lon], { radius: 3 + 30 * Math.sqrt(p), color: "#e0a030", weight: 1, fillOpacity: 0.25 })
-      .bindTooltip(`${(100 * p).toFixed(1)}%`).addTo(layer);
-  for (const m of ["FINAL", "B0", "B2", "T2"]) {
-    const ll = res.preds[m];
-    L.circleMarker(ll, { radius: m === "FINAL" ? 12 : 8, color: "#000", weight: 1, fillColor: COLORS[m], fillOpacity: 1 }).bindTooltip(NAMES[m]).addTo(layer);
-    if (res.truth) L.polyline([res.truth, ll], { color: COLORS[m], weight: 2, dashArray: "4 4" }).addTo(layer);
-    pts.push(ll);
-    const err = res.err_km ? `${res.err_km[m].toFixed(1)} km` : `${ll[0].toFixed(3)}, ${ll[1].toFixed(3)}`;
-    $("out").insertAdjacentHTML("beforeend", `<tr><td><span class="dot" style="background:${COLORS[m]}"></span>${NAMES[m]}</td><td>${err}</td></tr>`);
-  }
-  $("out").insertAdjacentHTML("beforeend", `<tr><td>Region confidence (p1000)</td><td>${(100 * res.p1000).toFixed(1)}%</td></tr>`);
-  if (res.truth) { L.circleMarker(res.truth, { radius: 7, color: "#000", fillColor: "#000", fillOpacity: 1 }).bindTooltip("truth").addTo(layer); pts.push(res.truth); }
+  status("thinking..."); $("result").textContent = ""; layer.clearLayers();
+  let r, res;
+  try { r = await fetch(`${API}/predict`, { method: "POST", body: file }); res = await r.json(); }
+  catch (e) { return status(`failed: ${e.message}`, true); }
+  if (!r.ok) return status(res.error ?? `error ${r.status}`, true);
+  const ll = res.preds.FINAL, pts = [ll];
+  status("");
+  $("result").textContent = res.err_km ? `${res.err_km.FINAL.toFixed(1)} km off` : ll.map(x => x.toFixed(3)).join(", ");
+  if (res.truth) { L.polyline([res.truth, ll], { color: "#000", weight: 1.5, dashArray: "3 4" }).addTo(layer); pin(res.truth, "here", "truth").addTo(layer); pts.push(res.truth); }
+  pin(ll, "guess", "final").setZIndexOffset(1000).addTo(layer);
   map.fitBounds(L.latLngBounds(pts).pad(0.5), { maxZoom: 12 });
 }
 
 const drop = $("drop");
 drop.onclick = () => $("file").click();
+drop.onkeydown = e => (e.key === "Enter" || e.key === " ") && (e.preventDefault(), $("file").click());
 $("file").onchange = e => e.target.files[0] && run(e.target.files[0]);
 drop.ondragover = e => { e.preventDefault(); drop.classList.add("over"); };
 drop.ondragleave = () => drop.classList.remove("over");
 drop.ondrop = e => { e.preventDefault(); drop.classList.remove("over"); e.dataTransfer.files[0] && run(e.dataTransfer.files[0]); };
 document.onpaste = e => { const f = [...e.clipboardData.files].find(f => f.type.startsWith("image/")); f && run(f); };
+wake();
 </script>
 </body>
 </html>

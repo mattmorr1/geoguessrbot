@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="only light">
+<title>how it works</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&display=swap" rel="stylesheet">
+<style>
+  :root { --ink: #000; --paper: #fff; --muted: #555; --mono: "IBM Plex Mono", ui-monospace, Menlo, monospace; }
+  html { background: var(--paper); color-scheme: only light; }
+  * { box-sizing: border-box; }
+  body { margin: 0; color: var(--ink); font: 400 0.9rem/1.65 var(--mono);
+         background: var(--paper) radial-gradient(circle, var(--ink) 0.6px, transparent 0.8px) 0 0 / 22px 22px; padding: 48px 24px 64px 16px; }
+  main { max-width: 680px; margin: 0 auto; display: flex; flex-direction: column; gap: 28px; }
+  .card { background: var(--paper); border: 1.5px solid var(--ink); box-shadow: 8px 8px 0 var(--ink); padding: clamp(20px, 5vw, 36px); }
+  h1, h2 { font-family: Georgia, "Times New Roman", serif; font-weight: 700; margin: 0 0 12px; }
+  h1 { font-size: 2rem; }
+  h2 { font-size: 1.25rem; }
+  p { margin: 0 0 12px; } p:last-child { margin-bottom: 0; }
+  ol { margin: 0; padding: 0; list-style: none; counter-reset: s; display: flex; flex-direction: column; gap: 14px; }
+  ol li { counter-increment: s; display: grid; grid-template-columns: 2.2em 1fr; gap: 8px; }
+  ol li::before { content: counter(s); font-weight: 600; border: 1.5px solid var(--ink); box-shadow: 2px 2px 0 var(--ink);
+                  height: 1.8em; display: grid; place-items: center; }
+  b { font-weight: 600; }
+  table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+  th, td { text-align: right; padding: 6px 0 6px 12px; border-bottom: 1px solid var(--ink); white-space: nowrap; }
+  th:first-child, td:first-child { text-align: left; padding-left: 0; white-space: normal; }
+  th { font-weight: 600; }
+  .scroll { overflow-x: auto; }
+  code { font: 400 0.82rem var(--mono); background: #f2f2f0; border: 1px solid var(--ink); padding: 0 4px; white-space: nowrap; }
+  tr.me td { font-weight: 600; }
+  .muted { color: var(--muted); font-size: 0.8rem; }
+  a { color: var(--ink); } a:hover { opacity: 0.6; }
+  nav { display: flex; justify-content: space-between; font-size: 0.8rem; }
+</style>
+</head>
+<body>
+<main>
+  <nav><a href="index.html">&larr; try it</a><a href="https://mattmorr.com/">mattmorr.com</a></nav>
+
+  <section class="card">
+    <h1>how does it work?</h1>
+    <p>no language model, no web search. the photo becomes an embedding, a classifier turns that into a prior over a
+      world grid, two retrieval searches propose ~75 candidate locations, and a learned ranker picks one.</p>
+  </section>
+
+  <section class="card">
+    <h2>the pipeline</h2>
+    <ol>
+      <li><span><b>encode.</b> two frozen vision transformers, streetclip (vit-l/14) and siglip 2 (so400m), each embed the
+        photo. the unit-normalized embeddings are concatenated and pca-projected to one 768-d vector.</span></li>
+      <li><span><b>prior.</b> a small mlp trunk feeds 7 classifier heads over a nested quadtree of the earth (osv-5m's
+        cells, country-sized down to ~town-sized), giving <code>log p(cell)</code> for every leaf cell.</span></li>
+      <li><span><b>photo search.</b> cosine similarity against ~2M training-photo embeddings, plus each hit's
+        <code>log p(cell)</code>. exact search, no approximate index. the top 32 hits become candidates.</span></li>
+      <li><span><b>map search.</b> a two-tower model: one tower maps the photo embedding, the other maps a location's
+        google alphaearth satellite embedding (64-d, 10 m pixels, pooled at 80&ndash;320 m) into a shared space. searching
+        land-grid points finds places nobody photographed. another 32 candidates; ~39% of final picks come from here.</span></li>
+      <li><span><b>rerank.</b> the 64 hits plus the top 8 cells and 3 point estimates (75 total) get 37 features each
+        (nearby hit mass, cell probability, gallery density, agreement between searches). a lightgbm lambdarank model
+        scores them, and the pick is the candidate with the highest expected geoscore under the softmaxed scores
+        (minimum bayes risk).</span></li>
+    </ol>
+  </section>
+
+  <section class="card">
+    <h2>how good is it?</h2>
+    <p>about level with the best published model: slightly ahead at region and country scale, behind at street level.
+      still a work in progress; newer versions aren't benchmarked yet.</p>
+    <div class="scroll">
+    <table>
+      <tr><th></th><th>geoscore</th><th>&le;25 km</th><th>&le;200</th><th>&le;750</th><th>&le;2500</th></tr>
+      <tr class="me"><td><b>this model</b>&dagger;</td><td>4125</td><td>29.6</td><td>67.7</td><td>84.7</td><td>93.5</td></tr>
+      <tr><td>pinpoint</td><td>4114</td><td>35.6</td><td>67.5</td><td>83.7</td><td>93.2</td></tr>
+      <tr><td>pinpoint, retrieval only</td><td>4035</td><td>32.1</td><td>65.6</td><td>82.8</td><td>92.8</td></tr>
+      <tr><td>hierloc</td><td>3963</td><td>&ndash;</td><td>&ndash;</td><td>&ndash;</td><td>&ndash;</td></tr>
+      <tr><td>rfm s&sup2;</td><td>3767</td><td>&ndash;</td><td>&ndash;</td><td>&ndash;</td><td>&ndash;</td></tr>
+      <tr><td>osv-5m baseline</td><td>3361</td><td>&ndash;</td><td>&ndash;</td><td>&ndash;</td><td>&ndash;</td></tr>
+      <tr><td>geoclip</td><td>&ndash;</td><td>21.5</td><td>52.1</td><td>72.1</td><td>&ndash;</td></tr>
+      <tr><td>locdiff</td><td>&ndash;</td><td>11.0</td><td>46.3</td><td>77.0</td><td>88.2</td></tr>
+      <tr><td>gre</td><td>&ndash;</td><td>9.7</td><td>35.6</td><td>72.5</td><td>91.1</td></tr>
+    </table>
+    </div>
+    <p class="muted">osv-5m test set. geoscore: 0&ndash;5000 per photo, averaged. km columns: % of guesses within that
+      distance. &ndash; = not reported. published results only, via <a href="https://arxiv.org/abs/2606.04133">pinpoint</a>.<br>
+      &dagger; 90% of the test set, run once; the other 10% was used for tuning.</p>
+  </section>
+
+  <section class="card">
+    <h2>limits</h2>
+    <p>made for outdoor street photos; indoor shots and screenshots are guesswork. uploads aren't stored.</p>
+    <p class="muted">data: osv-5m (mapillary, cc-by-sa), alphaearth (google), streetclip (cc-by-nc), siglip 2. tiles: openstreetmap, carto.</p>
+  </section>
+</main>
+</body>
+</html>
