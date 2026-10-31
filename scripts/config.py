@@ -31,6 +31,7 @@ TEST_LEVEL = 1000                                          # only level labelled
 AE_YEARS  = (2017, 2024)                                   # AlphaEarth annual coverage
 GRID_YEAR = 2020
 GRID_FILL = os.getenv("GRID_FILL", "0") == "1"   # T2 gallery also gets the sparse-area fill (bins.py fill)
+RHEAD     = os.getenv("RHEAD")   # B2 retrieves on runs/rhead_<RHEAD>.pt embeddings (retrieval_head.py) instead of raw features
 
 # ── Ingest ───────────────────────────────────────────────────────────────────
 

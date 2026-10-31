@@ -23,7 +23,7 @@ from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 
 import bins
 import config
-from eval import Env, quick_val
+from eval import Env, quick_val, write_manifest
 from model import AlphaBridge, ContrastiveQueue, bridge_loss, bridge_spec, cross_view_loss, device, pyramid_feats
 
 logger = logging.getLogger(__name__)
@@ -226,6 +226,7 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s",
                         handlers=[logging.StreamHandler(),
                                   logging.FileHandler(os.path.join(config.RUNS_DIR, a.name, "train.log"))])
+    write_manifest(os.path.join(config.RUNS_DIR, a.name, "manifest.json"), args=vars(a))
     train(a)
 
 

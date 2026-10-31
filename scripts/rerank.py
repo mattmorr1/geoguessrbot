@@ -5,7 +5,9 @@ and the B0/B2/T2 outputs. A LightGBM lambdarank model fit on val scores the cand
 minimum-Bayes-risk candidate under expected GeoScore. Inductive: test is never used for fitting; one pass on test.
 
 Usage:
-  python rerank.py ../runs/ft/best.pt --prior ../runs/f1/best.pt   # T2 from ft, B0/B2/prior from f1
+  python rerank.py ../runs/ft/best.pt --prior ../runs/f1/best.pt          # val candidate cache only (valcv.py compares)
+  python rerank.py ../runs/ft/best.pt --prior ../runs/f1/best.pt --test   # fit on val, the one pass on test
+RHEAD=<name> retrieves B2 on that retrieval head, with B2 tuned in runs/<prior>@rhead_<name>/tuned.json.
 """
 
 import argparse
@@ -22,6 +24,7 @@ from torch import nn
 import bins
 import config
 from eval import (CO_PRIMARY, COARSE_LEVELS, GALLERY_OF, Env, bootstrap, cell_centroid, distance_metrics, encode_queries,
+                  write_manifest,
                   gate_cfg, method_hits, query_vecs, refine, to_dev)
 from model import device, load_bridge
 
@@ -99,7 +102,7 @@ def candidates(pm, tm, env, cfg, X, gallery):
     fb = cell_centroid(env, qp["b0"].numpy())
     hits, preds, raw, leaves = {}, {"B0": fb}, {}, {}
     for m, q in (("B2", qp), ("T2", qt)):
-        gal, qv = gallery(m), query_vecs(q, X)
+        gal, qv = gallery(m), query_vecs(q, X, env.head)
         hs, hi = method_hits(m, q, gal, qv, cfg[m], env)
         preds[m] = refine(hs, hi, gal["xyz"], cfg[m]["radius_km"], fb)
         hi = hi[:, :K]
@@ -134,6 +137,7 @@ def extract(pm, tm, env, cfg, split, tag):
             "nn_km": torch.as_tensor(env.nn_km(Q["lat"], Q["lon"]), dtype=torch.float32)}
     os.makedirs(os.path.dirname(path), exist_ok=True)
     torch.save(out, path)
+    write_manifest(path + ".manifest.json", n_queries=len(out["loc"]), cfg=cfg)
     logger.info("extract %s: %d queries x %d candidates, %d loc + %d query feats", split, *out["loc"].shape, out["qf"].shape[1])
     return out
 
@@ -195,24 +199,35 @@ def setup(ckpt, prior=None):
     tm, ck = load_bridge(ckpt)
     pm = load_bridge(prior)[0] if prior else tm
     env = Env(ck["args"]["ae_radius"], ck["args"].get("feats", "streetclip"), ck["args"].get("rows", "all"))
-    with open(os.path.join(os.path.dirname(os.path.abspath(prior or ckpt)), "tuned.json")) as f:
+    tuned_dir = os.path.dirname(os.path.abspath(prior or ckpt)) + (f"@rhead_{config.RHEAD}" if config.RHEAD else "")
+    with open(os.path.join(tuned_dir, "tuned.json")) as f:
         tuned = json.load(f)
     g = gate_cfg(os.path.dirname(os.path.abspath(ckpt)))
     return pm, tm, env, {"B0": tuned["B0"], "B2": tuned["B2"], "T2": {**g["T2"], "alpha": g["B0"]["alpha"]}}, ck["args"]
+
+
+def cache_tag(env, tower_dir, prior_dir):
+    """Names a candidate cache by everything that changes it: runs, gallery size, retrieval head, grid fill."""
+    return (f"v2_{os.path.basename(prior_dir)}_{os.path.basename(tower_dir)}_n{len(env.rows)}"
+            + (f"_rh{config.RHEAD}" if config.RHEAD else "") + ("_fill" if config.GRID_FILL else ""))
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("ckpt", help="run with the location tower (T2)")
     ap.add_argument("--prior", help="run supplying the prior, B0 and B2 (default: ckpt)")
+    ap.add_argument("--test", action="store_true", help="also extract test, fit on val and score test once")
     a = ap.parse_args()
     pm, tm, env, cfg, _ = setup(a.ckpt, a.prior)
     run_dir = os.path.dirname(os.path.abspath(a.ckpt))
-    prior_dir = os.path.dirname(os.path.abspath(a.prior or a.ckpt))
-    tag = f"v2_{os.path.basename(prior_dir)}" + ("_fill" if config.GRID_FILL else "")
-    out = run_dir + "@rerank2_lgb" + ("_fill" if config.GRID_FILL else "")
+    tag = cache_tag(env, run_dir, os.path.dirname(os.path.abspath(a.prior or a.ckpt)))
+    tr = extract(pm, tm, env, cfg, "val", tag)
+    if not a.test:
+        return logger.info("val cache %s: %d queries; compare with valcv.py", tag, len(tr["loc"]))
+    out = f"{run_dir}@rerank_{tag}"
     os.makedirs(out, exist_ok=True)
-    tr, te = (extract(pm, tm, env, cfg, s, tag) for s in ("val", "test"))
+    write_manifest(os.path.join(out, "manifest.json"), [a.ckpt, a.prior or ""], cfg=cfg)
+    te = extract(pm, tm, env, cfg, "test", tag)
     model = lgb_fit(tr)
     choice = mbr(lgb_scores(model, te), te["cand"], MBR_T)
     res = {"cfg": cfg, "mbr_t": MBR_T, "test": report(te, choice)}

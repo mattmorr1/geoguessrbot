@@ -24,6 +24,10 @@ import json
 import logging
 import math
 import os
+import socket
+import subprocess
+import sys
+import time
 
 import numpy as np
 import torch
@@ -31,7 +35,7 @@ import torch
 import bins
 import config
 from geo_lookup import CC_TO_CONTINENT_NAME
-from model import device, load_bridge, pyramid_feats
+from model import device, embed_rhead, load_bridge, load_rhead, pyramid_feats
 
 logger = logging.getLogger(__name__)
 
@@ -243,6 +247,12 @@ class Env:
         self.train = bins.load("train")
         self.rows = self._rows("train")
         self.clip = bins.load_feats("train", self.rows, self.bbs)
+        self.head, self.photo = None, self.clip   # photo: B2 gallery vectors (raw features, or RHEAD embeddings)
+        if config.RHEAD:
+            self.head = load_rhead(os.path.join(config.RUNS_DIR, f"rhead_{config.RHEAD}.pt"))
+            self.photo = np.load(os.path.join(config.FEAT_DIR, f"rhead_{config.RHEAD}_train.npy"), mmap_mode="r")
+            if len(self.photo) != len(self.rows):
+                raise ValueError(f"rhead_{config.RHEAD} has {len(self.photo)} rows, env has {len(self.rows)}")
         self.ae_train = self._ae("train")
         self.pyramid = None
         self.min_km = 0.0
@@ -307,14 +317,14 @@ class Env:
         if name == "photos":
             keep = np.flatnonzero(free[rows])
             return self._gal(tr["lat"][rows[keep]], tr["lon"][rows[keep]], tr["cells"][rows[keep], bins.LEAF],
-                             np.zeros(len(keep), np.int8), clip=(self.clip, keep))
+                             np.zeros(len(keep), np.int8), clip=(self.photo, keep))
         if self.ae_train is None:
             raise FileNotFoundError(f"no train AE at r={self.r}")
         ok = ~np.isnan(np.asarray(self.ae_train[:, 0], np.float32)) & free
         g0 = rows[ok[rows]]
         if name == "fused":
             return self._gal(tr["lat"][g0], tr["lon"][g0], tr["cells"][g0, bins.LEAF], np.zeros(len(g0), np.int8),
-                             ae=(self.ae_train, g0), clip=(self.clip, np.flatnonzero(ok[rows])))
+                             ae=(self.ae_train, g0), clip=(self.photo, np.flatnonzero(ok[rows])))
         kind, lvl = name[-2], name[-1]
         if kind == "T" and tower is None:
             raise FileNotFoundError(f"{name} needs a checkpoint with a location tower")
@@ -337,7 +347,7 @@ class Env:
             src = np.r_[src, np.full(len(gsel), 2, np.int8)]
         vecs = {"ae" if kind == "G" else "loc": (vec, None)}
         if name == "BT2":   # photos (first len(g0) points) also carry clip; map points carry the offset flag
-            vecs |= {"clip": (self.clip, np.flatnonzero(ok[rows])), "flag": ((src > 0).astype(np.float16)[:, None], None)}
+            vecs |= {"clip": (self.photo, np.flatnonzero(ok[rows])), "flag": ((src > 0).astype(np.float16)[:, None], None)}
         return self._gal(lat, lon, leaf, src, **vecs)
 
     def _gal(self, lat, lon, leaf, src, **vec):
@@ -374,8 +384,9 @@ def method_hits(name, q, gal, qv, p, env):
     return retrieve(qv, prior, gal, {"ae" if name[0] == "G" else "loc": p["kappa"]}, env.n_leaf)
 
 
-def query_vecs(q, X):
-    return {"ae": q["ae"], "loc": q["loc"], "clip": normalize16(X), "flag": torch.ones(len(X), 1, dtype=torch.float16)}
+def query_vecs(q, X, head=None):
+    clip = normalize16(X if head is None else embed_rhead(head, X))
+    return {"ae": q["ae"], "loc": q["loc"], "clip": clip, "flag": torch.ones(len(X), 1, dtype=torch.float16)}
 
 
 def mixed_prior(q, p, env, gal):
@@ -398,6 +409,22 @@ def cell_centroid(env, leaf):
     return env.cells[f"lat_{bins.LEAF}"][leaf], env.cells[f"lon_{bins.LEAF}"][leaf]
 
 
+def write_manifest(path, inputs=(), **extra):
+    """Provenance beside an output: git commit + uncommitted diff, argv, env switches, input sizes/mtimes."""
+    git = lambda *a: subprocess.run(["git", "-C", config.ROOT, *a], capture_output=True, text=True).stdout.strip()
+    dirty = git("status", "--porcelain", "--untracked-files=no")
+    if dirty:
+        logger.warning("uncommitted changes recorded in %s", path)
+    m = {"time": time.strftime("%Y-%m-%dT%H:%M:%S"), "host": socket.gethostname(), "commit": git("rev-parse", "HEAD") or None,
+         "dirty": dirty or None, "diff": git("diff", "HEAD") or None, "argv": sys.argv,
+         "env": {k: os.environ.get(k) for k in ("SPLIT", "DATA_DIR", "FEAT_DIR", "RUNS_DIR", "GRID_FILL", "RHEAD")},
+         "inputs": {i: {"bytes": os.path.getsize(i), "mtime": os.path.getmtime(i)} for i in map(str, inputs) if os.path.exists(i)},
+         **extra}
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    with open(path, "w") as f:
+        json.dump(m, f, indent=1, default=str)
+
+
 def tune(model, ck, env, run_dir, only=None, val="val", objective="geoscore"):
     """Val-only grid: prior alpha by B0 objective, then each method keeps the (weight, R) maximizing the val objective."""
     Q, obj = env.queries(val), OBJECTIVES[objective]
@@ -408,7 +435,7 @@ def tune(model, ck, env, run_dir, only=None, val="val", objective="geoscore"):
     alpha = max(by_alpha, key=by_alpha.get)
     logger.info("prior alpha -> B0 val %s %s; using alpha=%s", objective, by_alpha, alpha)
     q = encode_queries(model, Q["X"], env.anc, alpha=alpha)
-    qv = query_vecs(q, Q["X"])
+    qv = query_vecs(q, Q["X"], env.head)
     methods = (["B1", "B2"] + (["G0", "G1", "G2", "Fused", "HG2"] if ck["args"]["w_ae"] > 0 else [])
                + (["T0", "T2", "HT2", "UT2", "BT2"] if model.tower is not None else []))
     methods = [m for m in methods if not only or m in only]
@@ -525,7 +552,7 @@ def stratify(d, keys):
 def predict(model, env, Q, tuned):
     """(lat, lon) per tuned method on queries Q, plus B0."""
     q = encode_queries(model, Q["X"], env.anc, alpha=tuned["B0"]["alpha"])
-    qv = query_vecs(q, Q["X"])
+    qv = query_vecs(q, Q["X"], env.head)
     preds = {"B0": cell_centroid(env, q["b0"].numpy())}
     for m, p in tuned.items():
         if m in GALLERY_OF:
@@ -596,7 +623,7 @@ def test(model, ck, env, run_dir):
     tuned = json.load(open(os.path.join(run_dir, "tuned.json")))
     Q = env.queries("test")
     q = encode_queries(model, Q["X"], env.anc, alpha=tuned["B0"]["alpha"])
-    qv = query_vecs(q, Q["X"])
+    qv = query_vecs(q, Q["X"], env.head)
     fb = cell_centroid(env, q["b0"].numpy())
     hier = encode_queries(model, Q["X"], env.anc, m=1, alpha=1.0)["b0"].numpy()
     preds, diag = {"B0": fb, "B0-hier": cell_centroid(env, hier), "B0-flat": cell_centroid(env, q["flat"].numpy())}, {}
@@ -750,9 +777,12 @@ def main():
         model = Decoupled(prior, model)
         run_dir += "_prior-" + os.path.basename(os.path.dirname(os.path.abspath(a.prior_ckpt)))
     env.min_km = a.min_km
+    if config.RHEAD:
+        run_dir += f"@rhead_{config.RHEAD}"
     if a.tag:
         run_dir += "@" + a.tag
     os.makedirs(run_dir, exist_ok=True)
+    write_manifest(os.path.join(run_dir, f"manifest_{a.cmd}.json"), [a.ckpt, a.prior_ckpt or ""])
     only = set(a.methods.split(",")) if a.methods else None
     {"tune": lambda *x: tune(*x, only, objective=a.objective), "test": test, "regions": lambda *x: regions(*x, a.split), "gate": gate_eval}[a.cmd](model, ck, env, run_dir)
 

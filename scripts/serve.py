@@ -3,7 +3,7 @@
 Demo server for the headline model: drop a photo, see the reranked FINAL pick plus the B0 (cell prior), B2 (photo kNN)
 and T2 (AlphaEarth map) candidates it chose among.
 
-Usage (headline = 2.0M-photo gallery; galleries are cached next to scorer.lgb on first start):
+Usage (scorer.lgb comes from rerank.py --test; galleries are cached beside it on first start):
   FEAT_DIR=../data/feats/backup_2m python serve.py --run ft --prior f1
   ssh -N -L 8000:127.0.0.1:8000 matt-pc   # IPv4 loopback: WSL forwarding ignores ::1; then open http://localhost:8000
 Cloud Run: --host 0.0.0.0 --port $PORT --origin https://geo.mattmorr.com (page hosted elsewhere, CORS to it).
@@ -75,8 +75,9 @@ def cached_gallery(env, m, tower, path):
 class Demo:
     def __init__(self, run, prior):
         ckpt = lambda r: os.path.join(config.RUNS_DIR, r, "best.pt")
-        out = os.path.join(config.RUNS_DIR, f"{run}@rerank2_lgb")
         self.pm, self.tm, self.env, self.cfg, args = rerank.setup(ckpt(run), ckpt(prior))
+        run_dir = os.path.join(config.RUNS_DIR, run)
+        out = f"{run_dir}@rerank_{rerank.cache_tag(self.env, run_dir, os.path.join(config.RUNS_DIR, prior))}"
         self.scorer = lgb.Booster(model_file=os.path.join(out, "scorer.lgb"))
         self.gals = {m: cached_gallery(self.env, m, self.tm.tower, os.path.join(out, f"serve_{m}.pt")) for m in ("B2", "T2")}
         self.encoders = load_encoders(args.get("feats", "streetclip"))

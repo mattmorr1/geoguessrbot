@@ -1,6 +1,7 @@
 import logging
 import math
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -295,6 +296,32 @@ def bridge_spec(cells, in_dim=768):
             "n_aux": [int(v) for v in cells["n_aux"]], "in_dim": int(in_dim)}
 
 
+class RetrievalHead(nn.Module):
+    """Photo features -> unit geo-retrieval embedding, trained photo<->photo (retrieval_head.py)."""
+
+    def __init__(self, d_in=768, hidden=1024, d_out=512):
+        super().__init__()
+        self.net = nn.Sequential(nn.Linear(d_in, hidden), nn.GELU(), nn.Linear(hidden, d_out))
+        self.log_inv_temp = nn.Parameter(torch.tensor(math.log(1 / 0.05)))
+
+    def forward(self, x):
+        return F.normalize(self.net(F.normalize(x.float(), dim=-1)), dim=-1)
+
+
+def load_rhead(path, map_location=device):
+    ck = torch.load(path, map_location=map_location, weights_only=False)
+    head = RetrievalHead(ck["d_in"], ck["args"].get("hidden", 1024), ck["args"].get("d_out", 512)).to(map_location)
+    head.load_state_dict(ck["state"])
+    return head.eval()
+
+
+@torch.no_grad()
+def embed_rhead(head, X, bs=1 << 16):
+    """[N, d_in] host features -> [N, d_out] fp16 numpy embeddings."""
+    return np.concatenate([head(torch.as_tensor(np.asarray(X[i:i + bs])).to(device)).half().cpu().numpy()
+                           for i in range(0, len(X), bs)]) if len(X) else np.zeros((0, head.net[-1].out_features), np.float16)
+
+
 def load_bridge(path, map_location=device):
     ck = torch.load(path, map_location=map_location, weights_only=False)
     model = AlphaBridge(**ck["spec"], head=ck["args"]["head"], loc=ck["args"].get("loc", "none")).to(map_location)
@@ -331,6 +358,15 @@ def encode_pixels(vision, pixel_values):
 # ============================================================
 # Loss Functions
 # ============================================================
+
+def photo_loss(e, xyz, inv_temp, tau_km):
+    """Soft InfoNCE over the other photos in the batch; targets softmax(-d_ij / tau_km), self excluded."""
+    eye = torch.eye(len(e), dtype=torch.bool, device=e.device)
+    with torch.no_grad():
+        nd = -R_EARTH_KM * torch.acos((xyz.double() @ xyz.double().T).clamp(-1, 1)) / tau_km
+        w = F.softmax(nd.masked_fill(eye, -math.inf), -1).float()
+    return -(w * F.log_softmax((e @ e.T * inv_temp).masked_fill(eye, -math.inf), -1).nan_to_num(0, 0, 0)).sum(-1).mean()
+
 
 def haversine_soft_ce(logits, xyz, cent_xyz, tau_km):
     """CE against PIGEON-style haversine-smoothed labels q_c = softmax(-d(x, centroid_c) / tau)."""

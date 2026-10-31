@@ -246,3 +246,15 @@ def test_pyramid_feats_masked_row_is_zero():
     H = torch.tensor([[255] * 64, [0] * 64], dtype=torch.uint8)
     f = pyramid_feats(M, H, torch.tensor([[0, 1]]))
     assert f.shape == (1, 2, 128) and (f[0, 1] == 0).all() and torch.allclose(f[0, 0, 64:], torch.ones(64))
+
+
+def test_photo_loss_prefers_geographic_embeddings():
+    from model import photo_loss, RetrievalHead
+    lon = torch.tensor([0.0, 0.01, 40.0, 40.01])
+    lat = torch.zeros(4)
+    la, lo = torch.deg2rad(lat), torch.deg2rad(lon)
+    xyz = torch.stack([la.cos() * lo.cos(), la.cos() * lo.sin(), la.sin()], 1)
+    geo = torch.nn.functional.normalize(torch.tensor([[1.0, 0], [1, 0.05], [0, 1], [0.05, 1]]), dim=-1)
+    assert photo_loss(geo, xyz, 20.0, 2.0) < photo_loss(geo[[0, 2, 1, 3]], xyz, 20.0, 2.0)
+    e = RetrievalHead(8, 16, 4)(torch.randn(5, 8))
+    assert torch.allclose(e.norm(dim=-1), torch.ones(5), atol=1e-5)
