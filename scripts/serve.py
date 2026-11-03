@@ -134,9 +134,9 @@ class Loader:
             if self.a.bundle:
                 fetch_bundle(self.a.bundle, config.ROOT)
             self.demo = Demo(self.a.run, self.a.prior)
-        except Exception as e:
+        except Exception:
             logger.exception("model load failed")
-            self.err = f"model failed to load: {e}"
+            self.err = "model failed to load, try again shortly"
         finally:
             self.ready.set()
 
@@ -196,7 +196,7 @@ def handler(loader, origin):
                 gt, img = exif_gps(raw), ImageOps.exif_transpose(raw).convert("RGB")
             except Exception as e:
                 logger.warning("bad upload: %s", e)
-                return self._send(400, json.dumps({"error": f"unreadable image: {e}"}).encode())
+                return self._send(400, b'{"error": "unreadable image"}')
             if err := loader.wait(WAIT_S):
                 return self._send(503, json.dumps({"error": err}).encode())
             with loader.lock:
