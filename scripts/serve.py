@@ -4,9 +4,10 @@ Demo server for the headline model: drop a photo, see the reranked FINAL pick pl
 and T2 (AlphaEarth map) candidates it chose among.
 
 Usage (scorer.lgb comes from rerank.py --test; galleries are cached beside it on first start):
-  FEAT_DIR=../data/feats/backup_2m python serve.py --run ft --prior f1
+  FEAT_DIR=~/serve_feats python serve.py --run ft --prior f1   # serve_feats: the 2M-photo headline gallery files
   ssh -N -L 8000:127.0.0.1:8000 matt-pc   # IPv4 loopback: WSL forwarding ignores ::1; then open http://localhost:8000
-Cloud Run: --host 0.0.0.0 --port $PORT --origin https://geo.mattmorr.com (page hosted elsewhere, CORS to it).
+Cloud Run (Dockerfile, deploy.sh): BUNDLE=gs://... is downloaded into the repo layout before the model loads. The port
+opens first, so the page renders at once; /health?wait=1 holds a request open (and CPU allocated) until the model is up.
 """
 
 import argparse
@@ -15,6 +16,8 @@ import io
 import json
 import logging
 import os
+import threading
+import urllib.parse
 
 import lightgbm as lgb
 import numpy as np
@@ -30,6 +33,7 @@ from model import device, encode_pixels, load_backbone
 logger = logging.getLogger(__name__)
 TOP_CELLS = 64
 MAX_UPLOAD = 25 << 20
+WAIT_S = 240          # under the Cloud Run request timeout (300 s)
 SOURCES = ("photo kNN", "AlphaEarth map", "prior cell", "B0", "B2", "T2")
 STATIC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 PAGES = {"/": "index.html", "/index.html": "index.html", "/how.html": "how.html"}
@@ -59,6 +63,19 @@ def exif_gps(img):
         return None
     dms = lambda v: float(v[0]) + float(v[1]) / 60 + float(v[2]) / 3600
     return dms(g[2]) * (-1 if g[1] == "S" else 1), dms(g[4]) * (-1 if g[3] == "W" else 1)
+
+
+def fetch_bundle(url, root):
+    """gs://bucket/prefix/** -> root/**, each blob in parallel 32 MB slices; on Cloud Run this download is the cold start."""
+    from google.cloud.storage import Client, transfer_manager
+    bucket, _, prefix = url.removeprefix("gs://").partition("/")
+    blobs = list(Client().list_blobs(bucket, prefix=prefix.rstrip("/") + "/"))
+    for b in blobs:
+        dst = os.path.join(root, b.name[len(prefix.rstrip("/")) + 1:])
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        transfer_manager.download_chunks_concurrently(b, dst, chunk_size=32 << 20, max_workers=16,
+                                                      worker_type=transfer_manager.THREAD)   # processes measured no faster
+    logger.info("bundle: %d files, %.2f GB from %s", len(blobs), sum(b.size for b in blobs) / 1e9, url)
 
 
 def cached_gallery(env, m, tower, path):
@@ -101,7 +118,40 @@ class Demo:
         return out
 
 
-def handler(demo, origin):
+class Loader:
+    """Builds the Demo off the request path; requests that need it wait on `ready`, then serialize on `lock`."""
+
+    def __init__(self, a):
+        self.a, self.lock, self._retry, self.demo = a, threading.Lock(), threading.Lock(), None
+        self._start()
+
+    def _start(self):
+        self.ready, self.err = threading.Event(), None
+        threading.Thread(target=self._load, daemon=True).start()
+
+    def _load(self):
+        try:
+            if self.a.bundle:
+                fetch_bundle(self.a.bundle, config.ROOT)
+            self.demo = Demo(self.a.run, self.a.prior)
+        except Exception as e:
+            logger.exception("model load failed")
+            self.err = f"model failed to load: {e}"
+        finally:
+            self.ready.set()
+
+    def wait(self, timeout):
+        """None once the model is up, else why not. A failed load (e.g. a download starved while Cloud Run throttled an
+        idle instance's CPU) is retried by the next request, which also keeps CPU allocated while it waits."""
+        with self._retry:
+            if self.ready.is_set() and self.err:
+                self._start()
+        if not self.ready.wait(timeout):
+            return "model still loading, try again shortly"
+        return self.err
+
+
+def handler(loader, origin):
     class H(http.server.BaseHTTPRequestHandler):
         def _send(self, code, body, ctype="application/json"):
             self.send_response(code)
@@ -125,9 +175,11 @@ def handler(demo, origin):
             self.end_headers()
 
         def do_GET(self):
-            if self.path == "/health":
-                return self._send(200, b'{"ready": true}')
-            page = PAGES.get(self.path)
+            url = urllib.parse.urlsplit(self.path)
+            if url.path == "/health":
+                err = loader.wait(WAIT_S if "wait" in urllib.parse.parse_qs(url.query) else 0)
+                return self._send(503 if loader.err else 200, json.dumps({"ready": err is None, "error": err}).encode())
+            page = PAGES.get(url.path)
             if page is None:
                 return self._send(404, b'{"error": "not found"}')
             with open(os.path.join(STATIC, page), "rb") as f:
@@ -145,7 +197,11 @@ def handler(demo, origin):
             except Exception as e:
                 logger.warning("bad upload: %s", e)
                 return self._send(400, json.dumps({"error": f"unreadable image: {e}"}).encode())
-            self._send(200, json.dumps(demo.locate(img, gt)).encode())
+            if err := loader.wait(WAIT_S):
+                return self._send(503, json.dumps({"error": err}).encode())
+            with loader.lock:
+                out = loader.demo.locate(img, gt)
+            self._send(200, json.dumps(out).encode())
 
     return H
 
@@ -157,9 +213,12 @@ def main():
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=int(os.getenv("PORT", "8000")))
     ap.add_argument("--origin", default=os.getenv("ALLOW_ORIGIN"), help="CORS origin of a separately hosted page")
+    ap.add_argument("--bundle", default=os.getenv("BUNDLE"), help="gs:// prefix holding data/ and runs/ to download first")
     a = ap.parse_args()
-    # single-threaded on purpose: requests serialize on one model (Cloud Run: --concurrency 1)
-    http.server.HTTPServer((a.host, a.port), handler(Demo(a.run, a.prior), a.origin)).serve_forever()
+    loader = Loader(a)
+    srv = http.server.ThreadingHTTPServer((a.host, a.port), handler(loader, a.origin))
+    logger.info("listening on %s:%d", a.host, a.port)
+    srv.serve_forever()
 
 
 if __name__ == "__main__":

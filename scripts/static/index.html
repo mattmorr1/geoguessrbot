@@ -47,6 +47,7 @@
   @media (max-width: 760px) {
     body { grid-template-columns: 1fr; grid-template-rows: auto 65vh; height: auto; padding: 16px 24px 28px 16px; gap: 24px; }
   }
+.leaflet-tile-pane { filter: grayscale(1); }   /* OSM is keyless but colorful; grey keeps the light look */
 </style>
 </head>
 <body>
@@ -63,17 +64,16 @@
 <script>
 const API = document.documentElement.dataset.api;
 const map = L.map("map", { worldCopyJump: true }).setView([20, 0], 2);
-L.tileLayer("https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png",
-  { maxZoom: 18, subdomains: "abcd", attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> &copy; <a href="https://carto.com/attributions">CARTO</a>' }).addTo(map);
+L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png",
+  { maxZoom: 18, attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>' }).addTo(map);
 const layer = L.layerGroup().addTo(map);
 const $ = id => document.getElementById(id);
 const pin = (ll, text, cls) => L.marker(ll, { icon: L.divIcon({ className: "pin", html: `<span class="tag ${cls}">${text}</span>`, iconSize: null, iconAnchor: [0, 0] }) });
 const status = (msg, err = false) => { $("status").textContent = msg; $("status").classList.toggle("err", err); };
 
 async function wake() {
-  if (!API) return;
-  status("waking up...");
-  try { const r = await fetch(`${API}/health`); status(r.ok ? "" : "offline", !r.ok); }
+  status("waking up the model...");
+  try { const r = await fetch(`${API}/health?wait=1`), res = await r.json(); res.ready ? status("") : status(res.error ?? "offline", !!res.error); }
   catch { status("offline", true); }
 }
 
