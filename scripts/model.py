@@ -1,5 +1,6 @@
 import logging
 import math
+import os
 
 import numpy as np
 import torch
@@ -13,6 +14,8 @@ device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is
 R_EARTH_KM = 6371.0088
 STREETCLIP = "geolocal/StreetCLIP"
 BACKBONES = {"streetclip": STREETCLIP, "siglip2": "google/siglip2-so400m-patch14-384"}
+BACKBONE_DIR = os.getenv("BACKBONE_DIR")   # serve: local fp16 vision-only exports (<dir>/<name>) instead of the HF hub
+src = lambda name: os.path.join(BACKBONE_DIR, name) if BACKBONE_DIR else BACKBONES[name]
 
 
 def lorentz_expmap0(v, eps=1e-10):
@@ -335,8 +338,8 @@ def load_bridge(path, map_location=device):
 
 def load_streetclip(dev=device):
     from transformers import CLIPImageProcessor, CLIPVisionModelWithProjection
-    vision = CLIPVisionModelWithProjection.from_pretrained(STREETCLIP)
-    return CLIPImageProcessor.from_pretrained(STREETCLIP), vision.to(dev, torch.float16 if dev == "cuda" else torch.float32).eval()
+    vision = CLIPVisionModelWithProjection.from_pretrained(src("streetclip"))
+    return CLIPImageProcessor.from_pretrained(src("streetclip")), vision.to(dev, torch.float16 if dev == "cuda" else torch.float32).eval()
 
 
 def load_backbone(name, dev=device):
@@ -344,9 +347,10 @@ def load_backbone(name, dev=device):
     if name == "streetclip":
         return load_streetclip(dev)
     from transformers import AutoModel, SiglipImageProcessorPil
-    vision = AutoModel.from_pretrained(BACKBONES[name]).vision_model
+    m = AutoModel.from_pretrained(src(name))
+    vision = getattr(m, "vision_model", m)   # full SigLIP from the hub, or the vision-only serve export
     # PIL backend pinned: same preprocessing in encode and serve, and no torchvision dependency
-    return SiglipImageProcessorPil.from_pretrained(BACKBONES[name]), vision.to(dev, torch.float16 if dev == "cuda" else torch.float32).eval()
+    return SiglipImageProcessorPil.from_pretrained(src(name)), vision.to(dev, torch.float16 if dev == "cuda" else torch.float32).eval()
 
 
 @torch.no_grad()

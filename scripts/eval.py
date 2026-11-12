@@ -246,16 +246,24 @@ class Env:
         self.n_leaf = len(self.anc)
         self.train = bins.load("train")
         self.rows = self._rows("train")
-        self.clip = bins.load_feats("train", self.rows, self.bbs)
-        self.head, self.photo = None, self.clip   # photo: B2 gallery vectors (raw features, or RHEAD embeddings)
-        if config.RHEAD:
-            self.head = load_rhead(os.path.join(config.RUNS_DIR, f"rhead_{config.RHEAD}.pt"))
-            self.photo = np.load(os.path.join(config.FEAT_DIR, f"rhead_{config.RHEAD}_train.npy"), mmap_mode="r")
-            if len(self.photo) != len(self.rows):
-                raise ValueError(f"rhead_{config.RHEAD} has {len(self.photo)} rows, env has {len(self.rows)}")
+        self.head = load_rhead(os.path.join(config.RUNS_DIR, f"rhead_{config.RHEAD}.pt")) if config.RHEAD else None
         self.ae_train = self._ae("train")
         self.pyramid = None
         self.min_km = 0.0
+
+    @functools.cached_property
+    def clip(self):
+        return bins.load_feats("train", self.rows, self.bbs)
+
+    @functools.cached_property
+    def photo(self):
+        """B2 gallery vectors: raw features, or RHEAD embeddings. Lazy, so serving from cached galleries never opens them."""
+        if not config.RHEAD:
+            return self.clip
+        p = np.load(os.path.join(config.FEAT_DIR, f"rhead_{config.RHEAD}_train.npy"), mmap_mode="r")
+        if len(p) != len(self.rows):
+            raise ValueError(f"rhead_{config.RHEAD} has {len(p)} rows, env has {len(self.rows)}")
+        return p
 
     @functools.cached_property
     def _seen_tree(self):

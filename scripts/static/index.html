@@ -71,9 +71,8 @@ const pin = (ll, text, cls) => L.marker(ll, { icon: L.divIcon({ className: "pin"
 const status = (msg, err = false) => { $("status").textContent = msg; $("status").classList.toggle("err", err); };
 
 async function wake() {
-  if (!API) return;
-  status("waking up...");
-  try { const r = await fetch(`${API}/health`); status(r.ok ? "" : "offline", !r.ok); }
+  status("waking up the model...");
+  try { const r = await fetch(`${API}/health?wait=1`), res = await r.json(); res.ready ? status("") : status(res.error ?? "offline", !!res.error); }
   catch { status("offline", true); }
 }
 
