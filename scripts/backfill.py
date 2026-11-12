@@ -161,6 +161,9 @@ def export_training_data():
 
     print(f"Total: {len(all_data)} records")
 
+    if not all_data:
+        raise SystemExit("Milvus collection is empty. Run load_dataset.py first to populate it.")
+
     clip_vecs = torch.tensor([d['streetclip_vec'] for d in all_data], dtype=torch.float32)
     alpha_vecs = torch.tensor([d['alphaearth_vec'] for d in all_data], dtype=torch.float32)
     gps_coords = [(d['gps']['lat'], d['gps']['lon']) for d in all_data]
@@ -268,9 +271,11 @@ def train():
         cache['country_idx'], cache['continent_idx'],
         cache['climate_zones'], cache['elevation_bins'],
     )
+    import platform
+    num_workers = 0 if platform.system() == "Windows" else 4
     loader = DataLoader(
         dataset, batch_size=BATCH_SIZE, sampler=sampler,
-        num_workers=4, pin_memory=True, drop_last=True,
+        num_workers=num_workers, pin_memory=(device == "cuda"), drop_last=True,
     )
 
     # LR schedule: linear warmup then cosine decay (step-level)
